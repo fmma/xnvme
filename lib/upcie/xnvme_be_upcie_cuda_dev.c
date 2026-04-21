@@ -15,9 +15,19 @@ static _Atomic int g_cuda_ctrlr_count;
 static void
 _cuda_rte_term(void)
 {
+	struct cudamem_mapping *m, *next;
+
 	if (!g_upcie_cuda_rte.is_initialized) {
 		return;
 	}
+
+	for (m = g_upcie_cuda_rte.mappings; m; m = next) {
+		next = m->next;
+		dmabuf_detach(&m->dmabuf);
+		free(m->phys_lut);
+		free(m);
+	}
+	g_upcie_cuda_rte.mappings = NULL;
 
 	cudamem_heap_term(&g_upcie_cuda_rte.cuda_heap);
 	cuCtxDestroy(g_upcie_cuda_rte.cu_ctx);
