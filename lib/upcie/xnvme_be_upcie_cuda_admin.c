@@ -31,7 +31,7 @@ xnvme_be_upcie_cuda_sync_cmd_admin(struct xnvme_cmd_ctx *ctx, void *dbuf, size_t
 
 	if (dbuf) {
 		err = nvme_request_prep_command_prps_contig_cuda(req, &g_upcie_cuda_rte.cuda_heap,
-								 g_upcie_cuda_rte.mappings, dbuf,
+								 &g_upcie_cuda_rte.mappings, dbuf,
 								 dbuf_nbytes, cmd);
 		if (err) {
 			XNVME_DEBUG("FAILED: prps_contig_cuda(); err(%d)", err);
