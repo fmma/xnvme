@@ -20,6 +20,23 @@ xnvme_be_upcie_queue_init(struct xnvme_queue *queue, int XNVME_UNUSED(opts))
 	struct xnvme_be_upcie_state *state = (void *)queue->base.dev->be.state;
 	int err;
 
+	if (state->ctrlr->attach) {
+		// Attach mode: take a pre-created qpair from the owner's pool. Its
+		// ring depth is fixed by the owner, so the caller's capacity must fit.
+		err = xnvme_be_upcie_attach_get_qpair(state->ctrlr, &upcie_queue->qpair);
+		if (err) {
+			XNVME_DEBUG("FAILED: xnvme_be_upcie_attach_get_qpair()");
+			return err;
+		}
+		if (upcie_queue->qpair.depth <= queue->base.capacity) {
+			XNVME_DEBUG("FAILED: attach qpair depth(%u) <= capacity(%u)",
+				    upcie_queue->qpair.depth, queue->base.capacity);
+			nvme_qpair_import_term(&upcie_queue->qpair);
+			return -EINVAL;
+		}
+		return 0;
+	}
+
 	// The spec says that for systems where memory ordering is not guaranteed, then one should
 	// leave room in the queue to avoid races. Thus, we do so here, by allocating one more than
 	// what is needed.
@@ -37,8 +54,13 @@ int
 xnvme_be_upcie_queue_term(struct xnvme_queue *queue)
 {
 	struct xnvme_queue_upcie *upcie_queue = (void *)queue;
+	struct xnvme_be_upcie_state *state = (void *)queue->base.dev->be.state;
 
-	nvme_qpair_term(&upcie_queue->qpair);
+	if (state->ctrlr->attach) {
+		nvme_qpair_import_term(&upcie_queue->qpair);
+	} else {
+		nvme_qpair_term(&upcie_queue->qpair);
+	}
 
 	return 0;
 }
