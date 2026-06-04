@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
+
 /**
  * CUDA NVMe Request Extension
  * ===========================
@@ -30,28 +31,32 @@
  */
 static inline void
 nvme_request_prep_command_prps_contig_cuda(struct nvme_request *request, struct cudamem_heap *heap,
-					   void *dbuf, size_t dbuf_nbytes,
-					   struct nvme_command *cmd)
+                                           void *dbuf, size_t dbuf_nbytes, struct nvme_command *cmd)
 {
-	const uint64_t npages =
-		(dbuf_nbytes + heap->config->pagesize - 1) >> heap->config->pagesize_shift;
 	const uint64_t pagesize = heap->config->pagesize;
+
+	cmd->prp1 = cudamem_heap_block_vtp(heap, dbuf);
+
+	/* Only PRP1 may carry a sub-page offset; the page count and every later
+	 * entry are measured from the page floor. ceil((off+nbytes)/pagesize). */
+	const uint64_t page_off = cmd->prp1 & (pagesize - 1);
+	const uint64_t page_base = cmd->prp1 - page_off;
+	const uint64_t npages =
+		(page_off + dbuf_nbytes + pagesize - 1) >> heap->config->pagesize_shift;
 
 	/* Chaining is not supported, thus assert that the given dbuf fits. */
 	assert(npages <= 1 + 512);
 
-	cmd->prp1 = cudamem_heap_block_vtp(heap, dbuf);
-
 	if (npages == 1) {
 		return;
 	} else if (npages == 2) {
-		cmd->prp2 = cmd->prp1 + pagesize;
+		cmd->prp2 = page_base + pagesize;
 	} else {
 		uint64_t *prp_list = (uint64_t *)request->prp;
 
 		cmd->prp2 = request->prp_addr;
 		for (uint64_t i = 1; i < npages; ++i) {
-			prp_list[i - 1] = cmd->prp1 + (i << heap->config->pagesize_shift);
+			prp_list[i - 1] = page_base + (i << heap->config->pagesize_shift);
 		}
 	}
 }
@@ -77,8 +82,7 @@ nvme_request_prep_command_prps_contig_cuda(struct nvme_request *request, struct 
  */
 static inline void
 nvme_request_prep_command_prps_iov_cuda(struct nvme_request *request, struct cudamem_heap *heap,
-					struct iovec *dvec, size_t dvec_cnt,
-					struct nvme_command *cmd)
+				   	struct iovec *dvec, size_t dvec_cnt, struct nvme_command *cmd)
 {
 	const uint64_t pagesize = heap->config->pagesize;
 	uint64_t *prp_list = (uint64_t *)request->prp;
@@ -124,8 +128,9 @@ nvme_request_prep_command_prps_iov_cuda(struct nvme_request *request, struct cud
  * Caveats
  * -------
  *
- * - `dbuf` must be host-page-aligned (NVMe PRP entries past PRP1 must be
- *   page-aligned per spec); asserted.
+ * - Only PRP1 may carry a sub-page offset; the page count and every later
+ *   entry are resolved from the page floor (entries past PRP1 must be
+ *   page-aligned per spec).
  * - Does *not* support PRP list chaining; only a single list page is constructed.
  *
  * @param request Pointer to the NVMe request context used for tracking and metadata.
@@ -145,15 +150,16 @@ nvme_request_prep_command_prps_contig_cuda_mapped(struct nvme_request *request,
 	const uint64_t pagesize = config->pagesize;
 	const uint64_t pagesize_shift = config->pagesize_shift;
 	const size_t prp_cap = pagesize / sizeof(uint64_t);
-	const uint64_t npages = (dbuf_nbytes + pagesize - 1) >> pagesize_shift;
+	const uint64_t page_off = (uintptr_t)dbuf & (pagesize - 1);
+	uint8_t *page_base = (uint8_t *)dbuf - page_off;
+	const uint64_t npages = (page_off + dbuf_nbytes + pagesize - 1) >> pagesize_shift;
 	int err;
-
-	assert(((uintptr_t)dbuf & (pagesize - 1)) == 0);
 
 	if (npages > 1 + prp_cap) {
 		return -EINVAL;
 	}
 
+	/* virt_to_phys preserves the sub-page offset, so PRP1 carries it. */
 	err = cudamem_mapping_virt_to_phys(registry, dbuf, &cmd->prp1);
 	if (err) {
 		return err;
@@ -163,15 +169,14 @@ nvme_request_prep_command_prps_contig_cuda_mapped(struct nvme_request *request,
 		return 0;
 	}
 	if (npages == 2) {
-		return cudamem_mapping_virt_to_phys(registry, (uint8_t *)dbuf + pagesize,
-						    &cmd->prp2);
+		return cudamem_mapping_virt_to_phys(registry, page_base + pagesize, &cmd->prp2);
 	}
 
 	uint64_t *prp_list = (uint64_t *)request->prp;
 	cmd->prp2 = request->prp_addr;
 	for (uint64_t i = 1; i < npages; ++i) {
-		err = cudamem_mapping_virt_to_phys(
-			registry, (uint8_t *)dbuf + (i << pagesize_shift), &prp_list[i - 1]);
+		err = cudamem_mapping_virt_to_phys(registry, page_base + (i << pagesize_shift),
+						   &prp_list[i - 1]);
 		if (err) {
 			return err;
 		}
