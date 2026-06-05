@@ -20,8 +20,8 @@
  * the descriptor describes. Other admin commands return a zeroed buffer and
  * success so geometry derivation does not hard-fail on optional probes.
  */
-static int
-_attach_cmd_admin(struct xnvme_cmd_ctx *ctx, void *dbuf, size_t dbuf_nbytes)
+int
+xnvme_be_upcie_attach_cmd_admin(struct xnvme_cmd_ctx *ctx, void *dbuf, size_t dbuf_nbytes)
 {
 	struct xnvme_be_upcie_state *state = (void *)ctx->dev->be.state;
 	struct upcie_attach_desc *adesc = state->ctrlr->adesc;
@@ -55,7 +55,11 @@ _attach_cmd_admin(struct xnvme_cmd_ctx *ctx, void *dbuf, size_t dbuf_nbytes)
 		((uint32_t *)dbuf)[0] = adesc->nsid;
 		return 0;
 	default:
-		memset(dbuf, 0, dbuf_nbytes);
+		/* Command-set-specific (ZONED/FS) and other identifies are not
+		 * synthesised. Report a command error like a conventional
+		 * controller so geometry derivation does not treat a zeroed
+		 * buffer as a valid response and read it. */
+		ctx->cpl.status.sc = 0x02; ///< Invalid Field in Command
 		return 0;
 	}
 }
@@ -71,7 +75,7 @@ xnvme_be_upcie_sync_cmd_admin(struct xnvme_cmd_ctx *ctx, void *dbuf, size_t dbuf
 	int err;
 
 	if (state->ctrlr->attach) {
-		return _attach_cmd_admin(ctx, dbuf, dbuf_nbytes);
+		return xnvme_be_upcie_attach_cmd_admin(ctx, dbuf, dbuf_nbytes);
 	}
 
 	ctrl = state->ctrlr->ctrl;

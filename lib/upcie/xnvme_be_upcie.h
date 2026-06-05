@@ -96,6 +96,11 @@ xnvme_be_upcie_ctrlr_term(void *handle);
 int
 xnvme_be_upcie_attach_get_qpair(struct xnvme_be_upcie_ctrlr *ctrlr, struct nvme_qpair *qp);
 
+// Serve an admin command in attach mode (no admin queue): Identify is answered
+// from the descriptor's captured payloads. Shared by the plain and cuda admin.
+int
+xnvme_be_upcie_attach_cmd_admin(struct xnvme_cmd_ctx *ctx, void *dbuf, size_t dbuf_nbytes);
+
 // Used by xnvme_be_upcie_cuda_async.c
 int
 xnvme_be_upcie_queue_init(struct xnvme_queue *queue, int opts);

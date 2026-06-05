@@ -14,7 +14,6 @@ xnvme_be_upcie_cuda_sync_cmd_io(struct xnvme_cmd_ctx *ctx, void *dbuf, size_t db
 				void *mbuf, size_t XNVME_UNUSED(mbuf_nbytes))
 {
 	struct xnvme_be_upcie_state *state = (void *)ctx->dev->be.state;
-	struct nvme_controller *ctrlr = state->ctrlr->ctrl;
 	struct nvme_command *cmd = (struct nvme_command *)&ctx->cmd;
 	struct nvme_completion *cpl = (struct nvme_completion *)&ctx->cpl;
 	struct nvme_request *req;
@@ -68,7 +67,7 @@ xnvme_be_upcie_cuda_sync_cmd_io(struct xnvme_cmd_ctx *ctx, void *dbuf, size_t db
 
 	nvme_qpair_sqdb_update(&state->ctrlr->sync);
 
-	err = nvme_qpair_reap_cpl(&state->ctrlr->sync, ctrlr->timeout_ms, cpl);
+	err = nvme_qpair_reap_cpl(&state->ctrlr->sync, state->ctrlr->timeout_ms, cpl);
 	if (err) {
 		XNVME_DEBUG("FAILED: nvme_qpair_reap_cpl();");
 		goto exit;
@@ -91,7 +90,6 @@ xnvme_be_upcie_cuda_sync_cmd_iov(struct xnvme_cmd_ctx *ctx, struct iovec *dvec, 
 				 size_t XNVME_UNUSED(mbuf_nbytes))
 {
 	struct xnvme_be_upcie_state *state = (void *)ctx->dev->be.state;
-	struct nvme_controller *ctrlr = state->ctrlr->ctrl;
 	struct nvme_command *cmd = (struct nvme_command *)&ctx->cmd;
 	struct nvme_completion *cpl = (struct nvme_completion *)&ctx->cpl;
 	struct nvme_request *req;
@@ -146,7 +144,7 @@ xnvme_be_upcie_cuda_sync_cmd_iov(struct xnvme_cmd_ctx *ctx, struct iovec *dvec, 
 
 	nvme_qpair_sqdb_update(&state->ctrlr->sync);
 
-	err = nvme_qpair_reap_cpl(&state->ctrlr->sync, ctrlr->timeout_ms, cpl);
+	err = nvme_qpair_reap_cpl(&state->ctrlr->sync, state->ctrlr->timeout_ms, cpl);
 	if (err) {
 		XNVME_DEBUG("FAILED: nvme_qpair_reap_cpl();");
 		goto exit;
