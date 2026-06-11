@@ -1,3 +1,5 @@
+#include <stdio.h>
+#include <stdlib.h>
 // SPDX-License-Identifier: BSD-3-Clause
 
 
@@ -45,18 +47,24 @@ nvme_request_prep_command_prps_contig_cuda(struct nvme_request *request, struct 
 		(page_off + dbuf_nbytes + pagesize - 1) >> heap->config->pagesize_shift;
 
 	/* Chaining is not supported, thus assert that the given dbuf fits. */
-	assert(npages <= 1 + 512);
+	if (npages > 1 + 512) {
+		fprintf(stderr,
+			"upcie: PRP page count %lu exceeds the 513-page no-chaining limit\n",
+			(unsigned long)npages);
+		abort();
+	}
 
 	if (npages == 1) {
 		return;
 	} else if (npages == 2) {
-		cmd->prp2 = page_base + pagesize;
+		cmd->prp2 = cudamem_dma_v2p(heap, (char *)dbuf - page_off + pagesize);
 	} else {
 		uint64_t *prp_list = (uint64_t *)request->prp;
+		char *vfloor = (char *)dbuf - page_off;
 
 		cmd->prp2 = request->prp_addr;
 		for (uint64_t i = 1; i < npages; ++i) {
-			prp_list[i - 1] = page_base + (i << heap->config->pagesize_shift);
+			prp_list[i - 1] = cudamem_dma_v2p(heap, vfloor + (i << heap->config->pagesize_shift));
 		}
 	}
 }

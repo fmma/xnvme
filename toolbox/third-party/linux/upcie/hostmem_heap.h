@@ -1,3 +1,5 @@
+#include <stdio.h>
+#include <stdlib.h>
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) Simon Andreas Frimann Lund <os@safl.dk>
 
@@ -158,6 +160,28 @@ hostmem_heap_init(struct hostmem_heap *heap, size_t size, struct hostmem_config 
 }
 
 static inline void
+hostmem_heap_check(struct hostmem_heap *heap, const char *where)
+{
+	char *lo = (char *)heap->memory.virt;
+	char *hi = lo + heap->memory.size;
+	struct hostmem_heap_block *b = heap->freelist;
+	unsigned long depth = 0;
+
+	while (b) {
+		if ((char *)b < lo || (char *)b + sizeof(*b) > hi) {
+			fprintf(stderr, "hostmem heap: corrupt freelist node %p (%s)\n",
+				(void *)b, where);
+			abort();
+		}
+		if (++depth > (1UL << 22)) {
+			fprintf(stderr, "hostmem heap: freelist cycle (%s)\n", where);
+			abort();
+		}
+		b = b->next;
+	}
+}
+
+static inline void
 hostmem_heap_block_free(struct hostmem_heap *heap, void *ptr)
 {
 	size_t alignment = heap->config->pagesize;
@@ -166,6 +190,8 @@ hostmem_heap_block_free(struct hostmem_heap *heap, void *ptr)
 	if (!ptr) {
 		return;
 	}
+
+	hostmem_heap_check(heap, "free");
 
 	block = (struct hostmem_heap_block *)((char *)ptr - alignment);
 	block->free = 1;
