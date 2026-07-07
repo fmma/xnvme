@@ -116,8 +116,12 @@
  * hot path needs only one LUT load.
  */
 struct cudamem_mapping_chunk_meta {
-	uint32_t rc;          ///< Refcount of overlapping registrations
-	struct dmabuf attach; ///< dma-buf attachment (valid when rc > 0)
+	uint32_t rc;             ///< Refcount of overlapping registrations
+	uint32_t owner_offset;   ///< 0 if this chunk owns the batch's dma-buf; else
+	                          ///< distance in chunk units back to the owner
+	uint32_t batch_size;     ///< Number of chunks sharing this batch's dma-buf
+	                          ///< (valid on owners only; 0 for members)
+	struct dmabuf attach;    ///< dma-buf attachment - valid only on owners
 };
 
 /**
@@ -209,10 +213,15 @@ cudamem_mapping_registry_init(struct cudamem_mapping_registry *registry,
 
 /**
  * Decrement rc on chunks [chunk_first, chunk_first + chunk_cnt) and detach
- * the dma-buf for each chunk whose rc transitions to zero.
+ * the dma-buf attach when the batch owner's rc transitions to zero.
  *
  * Chunks with rc == 0 on entry are skipped, making the helper safe for
- * partial unwind paths (where some chunks in the range were never bumped).
+ * partial unwind paths. Non-owner chunks in a batch only clear their
+ * lut_phys entry on rc->0; the physical dma-buf detach is bound to the
+ * owner chunk's transition. Because batches are populated and released as
+ * a unit (see cudamem_mapping_add's assumption of non-overlapping
+ * registrations), the owner and all its members reach rc==0 in the same
+ * deref pass.
  */
 static inline void
 cudamem_mapping_chunk_deref(struct cudamem_mapping_registry *registry, size_t chunk_first,
@@ -227,9 +236,13 @@ cudamem_mapping_chunk_deref(struct cudamem_mapping_registry *registry, size_t ch
 		}
 		cm->rc--;
 		if (cm->rc == 0) {
-			dmabuf_detach(&cm->attach);
-			memset(&cm->attach, 0, sizeof(cm->attach));
 			registry->lut_phys[idx] = 0;
+			if (cm->owner_offset == 0 && cm->batch_size > 0) {
+				dmabuf_detach(&cm->attach);
+				memset(&cm->attach, 0, sizeof(cm->attach));
+				cm->batch_size = 0;
+			}
+			cm->owner_offset = 0;
 		}
 	}
 }
@@ -291,23 +304,63 @@ cudamem_mapping_registry_term(struct cudamem_mapping_registry *registry)
 }
 
 /**
- * Populate one chunk from CUDA.
+ * Environment override for the per-registration batch size (in chunks). The
+ * mapping registry issues one cuMemGetHandleForAddressRange +
+ * dmabuf_attach + dmabuf_get_lut per batch of this many alloc_granularity
+ * chunks, instead of once per chunk. On NVIDIA discrete GPUs where
+ * alloc_granularity is 2 MiB, the default 128 chunks per batch means one
+ * driver call per 256 MiB. For a 40 GiB registration that collapses from
+ * 20480 driver calls to 160 - roughly two orders of magnitude cheaper on
+ * setup and teardown.
+ */
+#ifndef CUDAMEM_MAPPING_DEFAULT_BATCH_CHUNKS
+#define CUDAMEM_MAPPING_DEFAULT_BATCH_CHUNKS 128
+#endif
+
+static inline size_t
+cudamem_mapping_batch_chunks(void)
+{
+	static size_t cached = 0;
+	if (cached) return cached;
+	const char *env = getenv("CUDAMEM_MAPPING_BATCH_CHUNKS");
+	if (env && *env) {
+		long long v = atoll(env);
+		if (v > 0) {
+			cached = (size_t)v;
+			return cached;
+		}
+	}
+	cached = CUDAMEM_MAPPING_DEFAULT_BATCH_CHUNKS;
+	return cached;
+}
+
+/**
+ * Populate `batch_chunks` consecutive chunks starting at the VA
+ * corresponding to `chunk_first` from a single dma-buf.
  *
- * Calls cuMemGetHandleForAddressRange for the chunk's full alloc_granularity
- * extent, attaches the dma-buf, fetches the host-page LUT, verifies that the
- * LUT is contiguous (BAR1 large-page assumption), and returns the chunk's
- * phys_base via *phys_base_out and the attachment via *attach_out. On any
- * failure both outputs are left untouched and an errno is returned.
+ * Issues ONE cuMemGetHandleForAddressRange for the full
+ * batch_chunks * alloc_granularity range, attaches the dma-buf once, and
+ * fetches the host-page LUT once. If every entry in the LUT is
+ * page-contiguous (BAR1 large-page assumption at the batch scale), fills
+ * the mapping registry's per-chunk lut_phys and lut_meta entries so that
+ * `_virt_to_phys` remains O(1) LUT-load. The first chunk in the batch
+ * (chunk_first) owns the dmabuf attachment; subsequent chunks store their
+ * offset back to the owner.
  *
- * @return 0 on success, negative errno on failure.
+ * @return 0 on success, negative errno on failure. All partial state is
+ *         torn down on error.
  */
 static inline int
-cudamem_mapping_chunk_populate(uint64_t *phys_base_out, struct dmabuf *attach_out,
-			       uint64_t chunk_va, struct cudamem_config *config)
+cudamem_mapping_batch_populate(struct cudamem_mapping_registry *registry,
+			       struct cudamem_config *config,
+			       size_t chunk_first, size_t batch_chunks)
 {
 	const size_t pagesize = (size_t)config->pagesize;
 	const size_t gran = config->alloc_granularity;
-	const size_t nphys = gran >> config->pagesize_shift;
+	const int gran_shift = registry->gran_shift;
+	const size_t range_bytes = batch_chunks * gran;
+	const size_t nphys = range_bytes >> config->pagesize_shift;
+	const uint64_t chunk_va = (uint64_t)chunk_first << gran_shift;
 	uint64_t *tmp = NULL;
 	int dmabuf_fd = -1;
 	struct dmabuf attach = {0};
@@ -319,11 +372,11 @@ cudamem_mapping_chunk_populate(uint64_t *phys_base_out, struct dmabuf *attach_ou
 		return -ENOMEM;
 	}
 
-	cr = cuMemGetHandleForAddressRange(&dmabuf_fd, (CUdeviceptr)chunk_va, gran,
+	cr = cuMemGetHandleForAddressRange(&dmabuf_fd, (CUdeviceptr)chunk_va, range_bytes,
 					   CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
 	if (cr != CUDA_SUCCESS) {
 		UPCIE_DEBUG("FAILED: cuMemGetHandleForAddressRange(0x%" PRIx64 ", %zu), cr: %d",
-			    chunk_va, gran, cr);
+			    chunk_va, range_bytes, cr);
 		err = -EIO;
 		goto err_free;
 	}
@@ -343,7 +396,7 @@ cudamem_mapping_chunk_populate(uint64_t *phys_base_out, struct dmabuf *attach_ou
 
 	for (size_t i = 1; i < nphys; ++i) {
 		if (tmp[i] != tmp[0] + i * pagesize) {
-			UPCIE_DEBUG("FAILED: chunk LUT not contiguous at i=%zu; phys[0]=0x%" PRIx64
+			UPCIE_DEBUG("FAILED: batch LUT not contiguous at i=%zu; phys[0]=0x%" PRIx64
 				    " phys[%zu]=0x%" PRIx64,
 				    i, tmp[0], i, tmp[i]);
 			err = -EOPNOTSUPP;
@@ -351,8 +404,20 @@ cudamem_mapping_chunk_populate(uint64_t *phys_base_out, struct dmabuf *attach_ou
 		}
 	}
 
-	*phys_base_out = tmp[0];
-	*attach_out = attach;
+	for (size_t k = 0; k < batch_chunks; ++k) {
+		const size_t idx = chunk_first + k;
+		registry->lut_phys[idx] = tmp[0] + (uint64_t)k * gran;
+		struct cudamem_mapping_chunk_meta *cm = &registry->lut_meta[idx];
+		cm->owner_offset = (uint32_t)k;
+		if (k == 0) {
+			cm->attach = attach;
+			cm->batch_size = (uint32_t)batch_chunks;
+		} else {
+			memset(&cm->attach, 0, sizeof(cm->attach));
+			cm->batch_size = 0;
+		}
+	}
+
 	free(tmp);
 	return 0;
 
@@ -424,20 +489,56 @@ cudamem_mapping_add(struct cudamem_mapping_registry *registry, struct cudamem_co
 	m->vaddr = va;
 	m->size = nbytes;
 
-	for (size_t k = 0; k < chunk_cnt; ++k) {
-		const size_t idx = chunk_first + k;
-		struct cudamem_mapping_chunk_meta *cm = &registry->lut_meta[idx];
+	{
+		const size_t max_batch = cudamem_mapping_batch_chunks();
+		size_t k = 0;
+		while (k < chunk_cnt) {
+			const size_t idx = chunk_first + k;
+			struct cudamem_mapping_chunk_meta *cm = &registry->lut_meta[idx];
 
-		if (cm->rc == 0) {
-			const uint64_t chunk_va = (uint64_t)idx << gran_shift;
-			err = cudamem_mapping_chunk_populate(&registry->lut_phys[idx], &cm->attach,
-							     chunk_va, config);
-			if (err) {
-				goto err_unwind;
+			if (cm->rc > 0) {
+				cm->rc++;
+				bumped_cnt++;
+				++k;
+				continue;
 			}
+
+			/* Cap batch at min(max_batch, remaining) and shrink further
+			 * to stop at the next already-populated chunk so we never
+			 * re-map a live range. */
+			size_t batch = chunk_cnt - k;
+			if (batch > max_batch) {
+				batch = max_batch;
+			}
+			for (size_t j = 1; j < batch; ++j) {
+				if (registry->lut_meta[idx + j].rc > 0) {
+					batch = j;
+					break;
+				}
+			}
+
+			/* Try the requested batch size; on -EOPNOTSUPP the udmabuf
+			 * LUT was not host-page-contiguous at that scale (the
+			 * CUDA driver accepted the range but BAR1 large-page
+			 * assumption broke down). Halve and retry down to single
+			 * chunks before giving up. */
+			for (;;) {
+				err = cudamem_mapping_batch_populate(registry, config, idx, batch);
+				if (err == 0) {
+					break;
+				}
+				if (err != -EOPNOTSUPP || batch == 1) {
+					goto err_unwind;
+				}
+				batch /= 2;
+			}
+
+			for (size_t j = 0; j < batch; ++j) {
+				registry->lut_meta[idx + j].rc = 1;
+			}
+			bumped_cnt += batch;
+			k += batch;
 		}
-		cm->rc++;
-		bumped_cnt++;
 	}
 
 	m->next = registry->list;

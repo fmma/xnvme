@@ -78,8 +78,9 @@ cudamem_config_pp(struct cudamem_config *config)
  * driver maps both VMM and cuMemAlloc allocations through the same BAR1
  * page-table large-page mechanism, so the VMM minimum reservation unit
  * matches the contiguous IOVA window each cuMemAlloc chunk occupies. The
- * contiguity check in cudamem_mapping_chunk_populate (returning -EOPNOTSUPP
- * when violated) catches a hardware/driver mismatch at runtime.
+ * contiguity check in cudamem_mapping_batch_populate (returning -EOPNOTSUPP
+ * when violated) catches a hardware/driver mismatch at runtime, allowing
+ * cudamem_mapping_add to fall back to a smaller batch size.
  *
  * BAR1 size is read via pci_bar_size(bdf, 1, ...), where <bdf> is obtained
  * from cuDeviceGetPCIBusId(). The PCI BAR index 1 follows NVIDIA's discrete
