@@ -113,6 +113,126 @@ nvme_qpair_init(struct nvme_qpair *qp, uint32_t qid, uint16_t depth, uint8_t *ba
 }
 
 /**
+ * Serializable description of an I/O queue-pair for cross-process handout
+ * ======================================================================
+ *
+ * An I/O queue-pair created by one process (the "owner", which holds the
+ * controller and admin queue) can be driven by a different process (a
+ * "client") without that client ever touching the admin queue. The only
+ * controller-side state a client needs is:
+ *
+ *   - qid/depth, so it can address the right doorbells and bound the rings.
+ *   - the location of the SQ/CQ rings, which the owner allocated from a heap
+ *     backed by a shared (MAP_SHARED memfd/hugetlbfs) hugepage. The client
+ *     maps the same region and addresses the rings by their offset within it.
+ *
+ * Everything else a client uses for I/O -- the data buffers and the per-request
+ * PRP lists -- lives in the client's own heap. Under physical DMA addressing
+ * (iommu=off) those physical addresses are process-independent, so the NVMe
+ * controller honours PRP entries the client filled in regardless of which
+ * process owns the backing memory. The owner must NOT issue any I/O on the
+ * qpair before handing it off, so the client can assume a pristine CQ
+ * (head 0, phase 1).
+ */
+struct nvme_qpair_export {
+	uint32_t qid;       ///< I/O queue identifier (> 0)
+	uint16_t depth;     ///< Number of entries in the SQ/CQ
+	uint16_t _pad;
+	uint64_t sq_offset; ///< Byte offset of the SQ ring within the shared region
+	uint64_t cq_offset; ///< Byte offset of the CQ ring within the shared region
+};
+
+/**
+ * Fill an export descriptor for a qpair the owner created from `owner_heap`.
+ *
+ * `owner_heap` must be the heap the qpair's SQ/CQ rings were allocated from
+ * (i.e. the heap passed to nvme_controller_open / create_io_qpair), backed by
+ * a shared hugepage so the client can map it. The offsets are relative to the
+ * start of that heap's backing region.
+ */
+static inline void
+nvme_qpair_export_from(const struct nvme_qpair *qp, struct hostmem_heap *owner_heap,
+		       struct nvme_qpair_export *out)
+{
+	out->qid = qp->qid;
+	out->depth = qp->depth;
+	out->_pad = 0;
+	out->sq_offset = (uint64_t)((char *)qp->sq - (char *)owner_heap->memory.virt);
+	out->cq_offset = (uint64_t)((char *)qp->cq - (char *)owner_heap->memory.virt);
+}
+
+/**
+ * Build a client-side qpair from an export descriptor.
+ *
+ * The SQ/CQ rings live in `region_base`, the client's mapping of the shared
+ * region the owner created the qpair from (e.g. hostmem_hugepage_import() of
+ * owner_heap->memory.path). Doorbells are taken from `bar0`, the client's own
+ * mapping of the controller's BAR0. The request pool and its PRP lists are
+ * allocated from `heap`, the client's own DMA heap; that heap is also used to
+ * resolve PRP physical addresses for I/O submitted on this qpair.
+ *
+ * Does not touch the controller; the qpair was already created by the owner.
+ * Release with nvme_qpair_import_term(), which frees the client-owned request
+ * pool but leaves the shared rings to the owner.
+ *
+ * @return 0 on success, negative errno on failure.
+ */
+static inline int
+nvme_qpair_import(struct nvme_qpair *qp, const struct nvme_qpair_export *desc, void *region_base,
+		  uint8_t *bar0, struct hostmem_heap *heap)
+{
+	int dstrd = nvme_reg_cap_get_dstrd(nvme_mmio_cap_read(bar0));
+	int err;
+
+	qp->heap = heap;
+	qp->qid = desc->qid;
+	qp->depth = desc->depth;
+	qp->sq = (char *)region_base + desc->sq_offset;
+	qp->cq = (char *)region_base + desc->cq_offset;
+	qp->sqdb = bar0 + 0x1000 + ((2 * desc->qid) << (2 + dstrd));
+	qp->cqdb = bar0 + 0x1000 + ((2 * desc->qid + 1) << (2 + dstrd));
+	qp->tail = 0;
+	qp->tail_last_written = UINT16_MAX;
+	qp->head = 0;
+	qp->phase = 1;
+
+	qp->rpool = calloc(1, sizeof(*qp->rpool));
+	if (!qp->rpool) {
+		UPCIE_DEBUG("FAILED: calloc(rpool); errno(%d)", errno);
+		return -errno;
+	}
+	nvme_request_pool_init(qp->rpool);
+
+	err = nvme_request_pool_init_prps(qp->rpool, heap);
+	if (err) {
+		free(qp->rpool);
+		qp->rpool = NULL;
+		UPCIE_DEBUG("FAILED: nvme_request_pool_init_prps; err(%d)", err);
+		return err;
+	}
+
+	return 0;
+}
+
+/**
+ * Release a qpair built with nvme_qpair_import().
+ *
+ * Frees the client-owned request pool and its PRP lists from the client heap.
+ * Does not free the shared SQ/CQ rings (owned by the qpair's creator) and does
+ * not touch the controller.
+ */
+static inline void
+nvme_qpair_import_term(struct nvme_qpair *qp)
+{
+	if (qp->rpool) {
+		nvme_request_pool_term_prps(qp->rpool, qp->heap);
+		free(qp->rpool);
+		qp->rpool = NULL;
+	}
+	memset(qp, 0, sizeof(*qp));
+}
+
+/**
  * Reaps at most a single completion and informs the controller via qp->cqdb
  *
  * @param qp A queue-pair as represented by 'struct nvme_qp'

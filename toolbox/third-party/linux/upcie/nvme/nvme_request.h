@@ -1,3 +1,5 @@
+#include <stdio.h>
+#include <stdlib.h>
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) Simon Andreas Frimann Lund <os@safl.dk>
 
@@ -174,25 +176,36 @@ static inline void
 nvme_request_prep_command_prps_contig(struct nvme_request *request, struct hostmem_heap *heap,
 				      void *dbuf, size_t dbuf_nbytes, struct nvme_command *cmd)
 {
-	const uint64_t npages = (dbuf_nbytes + heap->config->pagesize - 1) >> heap->config->pagesize_shift;
 	const uint64_t pagesize = heap->config->pagesize;
 
-	/* Chaining is not supported, thus assert that the given dbuf fits. */
-	assert(npages <= 1 + 512);
-
 	cmd->prp1 = hostmem_dma_v2p(heap, dbuf);
+
+	/* Only PRP1 may carry a sub-page offset; the page count and every later
+	 * entry are measured from the page floor. ceil((off+nbytes)/pagesize). */
+	const uint64_t page_off = cmd->prp1 & (pagesize - 1);
+	const uint64_t page_base = cmd->prp1 - page_off;
+	const uint64_t npages =
+		(page_off + dbuf_nbytes + pagesize - 1) >> heap->config->pagesize_shift;
+
+	/* Chaining is not supported, thus assert that the given dbuf fits. */
+	if (npages > 1 + 512) {
+		fprintf(stderr,
+			"upcie: PRP page count %lu exceeds the 513-page no-chaining limit\n",
+			(unsigned long)npages);
+		abort();
+	}
 
 	if (npages == 1) {
 		return;
 	} else if (npages == 2) {
-		cmd->prp2 = hostmem_dma_v2p(heap, dbuf + pagesize);
+		cmd->prp2 = hostmem_dma_v2p(heap, (char *)dbuf - page_off + pagesize);
 	} else {
 		uint64_t *prp_list = request->prp;
+		char *vfloor = (char *)dbuf - page_off;
 
 		cmd->prp2 = request->prp_addr;
 		for (uint64_t i = 1; i < npages; ++i) {
-
-			prp_list[i - 1] = cmd->prp1 + (i << heap->config->pagesize_shift);
+			prp_list[i - 1] = hostmem_dma_v2p(heap, vfloor + (i << heap->config->pagesize_shift));
 		}
 	}
 }
