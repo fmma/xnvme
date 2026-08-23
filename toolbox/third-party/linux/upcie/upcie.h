@@ -108,6 +108,7 @@ extern "C" {
 #include <upcie/nvme/nvme_controller_dmamem_vfio.h>
 #include <upcie/nvme/nvme_controller_dmamem_uio.h>
 #include <upcie/nvme/nvme_controller_dmamem_type1.h>
+#include <upcie/upcie_attach.h>
 #endif
 
 #ifdef __cplusplus

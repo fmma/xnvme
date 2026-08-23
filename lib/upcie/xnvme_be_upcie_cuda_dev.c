@@ -168,6 +168,25 @@ xnvme_be_upcie_cuda_ctrlr_term(void *handle)
  * (1 GiB) are initialized when the first upcie-cuda device is opened.
  */
 static int
+_dbuf_write_cuda(void *dbuf, size_t offset, const void *src, size_t nbytes)
+{
+	CUdeviceptr dst = (CUdeviceptr)((uint8_t *)dbuf + offset);
+	CUresult res;
+
+	if (src) {
+		res = cuMemcpyHtoD(dst, src, nbytes);
+	} else {
+		res = cuMemsetD8(dst, 0, nbytes);
+	}
+	if (res != CUDA_SUCCESS) {
+		XNVME_DEBUG("FAILED: cuMemcpy/Memset(dbuf); CUresult(%d)", res);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+static int
 xnvme_be_upcie_cuda_dev_open(struct xnvme_dev *dev)
 {
 	int err;
@@ -194,6 +213,7 @@ xnvme_be_upcie_cuda_dev_open(struct xnvme_dev *dev)
 		struct xnvme_be_upcie_state *state = (void *)dev->be.state;
 
 		state->dmem = &g_upcie_cuda_rte.dmem;
+		state->dbuf_write = _dbuf_write_cuda;
 	}
 
 	atomic_fetch_add(&g_cuda_ctrlr_count, 1);

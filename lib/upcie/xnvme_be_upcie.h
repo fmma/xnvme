@@ -6,6 +6,7 @@
 #define __INTERNAL_XNVME_BE_UPCIE_H
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 
 #include <xnvme_be.h>
 #include <xnvme_queue.h>
@@ -139,6 +140,21 @@ struct xnvme_be_upcie_ctrlr {
 	struct nvme_qpair sync; ///< Shared submission/completion queue for synchronous IOs
 	struct xnvme_be_upcie_qpair_offsets sync_offsets; ///< Heap offsets of the sync qpair
 	struct xnvme_be_upcie_ctrlr_mproc mproc;
+
+
+	/* Attach mode (XNVME_UPCIE_ATTACH): this process drives I/O qpairs handed
+	 * out by a foreign controller owner instead of opening the controller. In
+	 * that case `ctrl` is NULL; the qpairs live in `region`, their doorbells
+	 * in `func`'s BAR0, and geometry comes from `adesc`'s Identify payloads.
+	 * `sync` and per-queue qpairs are imported from adesc->qpairs[], handed out
+	 * in order via next_qpair (index 0 is `sync`). */
+	bool handout;
+	struct pci_func func;
+	struct hostmem_hugepage region;
+	struct upcie_attach_desc *adesc;
+	uint32_t next_qpair;
+
+	int timeout_ms; ///< Command timeout; mirrors ctrl->timeout_ms, or CAP.TO in attach mode
 };
 
 /**
@@ -155,7 +171,11 @@ struct xnvme_be_upcie_state {
 	struct xnvme_be_upcie_ctrlr *ctrlr; ///< Shared controller (first field for platform)
 	struct dmamem *dmem;                ///< Where this device's data buffers live
 
-	uint8_t _rvds[112];
+	/* Write into a data buffer, which may be device memory. Set by dev_open;
+	 * the GPU backends override it with a host-to-device copy. */
+	int (*dbuf_write)(void *dbuf, size_t offset, const void *src, size_t nbytes);
+
+	uint8_t _rvds[104];
 };
 XNVME_STATIC_ASSERT(sizeof(struct xnvme_be_upcie_state) == XNVME_BE_STATE_NBYTES, "Incorrect size")
 
@@ -312,6 +332,12 @@ xnvme_be_upcie_ctrlr_term(void *handle);
  * memory. The GPU backends wire these into their own xnvme_be_{admin,sync,
  * async} in xnvme_be_upcie_{cuda,hip}.c.
  */
+// Hand out the next pre-created I/O qpair from an attached controller's pool,
+// imported into *qp. Returns -ENOMEM when the pool is exhausted.
+int
+xnvme_be_upcie_attach_get_qpair(struct xnvme_be_upcie_ctrlr *ctrlr, struct nvme_qpair *qp,
+				size_t *prp_offset_out);
+
 int
 xnvme_be_upcie_queue_init(struct xnvme_queue *queue, int opts);
 int

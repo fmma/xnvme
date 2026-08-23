@@ -9,6 +9,7 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <stdatomic.h>
+#include <stdlib.h>
 #include <xnvme_dev.h>
 #include <xnvme_be_upcie.h>
 
@@ -367,6 +368,134 @@ _pci_enable_bus_master(const char *bdf)
 	return 0;
 }
 
+int
+xnvme_be_upcie_attach_get_qpair(struct xnvme_be_upcie_ctrlr *ctrlr, struct nvme_qpair *qp,
+				size_t *prp_offset_out)
+{
+	uint8_t *bar0 = ctrlr->func.bars[0].region;
+	int err;
+
+	if (ctrlr->next_qpair >= ctrlr->adesc->nqpairs) {
+		XNVME_DEBUG("FAILED: attach qpair pool exhausted (%u)", ctrlr->adesc->nqpairs);
+		return -ENOMEM;
+	}
+
+	err = nvme_qpair_import(qp, &ctrlr->adesc->qpairs[ctrlr->next_qpair], ctrlr->region.virt,
+				bar0, &g_upcie_rte.mem.heap, prp_offset_out);
+	if (err) {
+		XNVME_DEBUG("FAILED: nvme_qpair_import(idx=%u); err(%d)", ctrlr->next_qpair, err);
+		return err;
+	}
+	ctrlr->next_qpair++;
+
+	return 0;
+}
+
+/**
+ * Attach to a controller owned by another process.
+ *
+ * Reads the upcie_attach_desc named by `attach_path` (written by the controller
+ * owner), maps BAR0 for the doorbells and the shared region holding
+ * the SQ/CQ rings, and imports the first pre-created qpair as the sync qpair.
+ * The controller itself is never opened or reset; geometry is supplied later
+ * from the descriptor's Identify payloads via the admin path.
+ */
+static void *
+_ctrlr_attach_init(struct xnvme_dev *dev, const char *attach_path)
+{
+	struct xnvme_be_upcie_ctrlr *ctrlr;
+	uint8_t *bar0;
+	int err;
+
+	/* Attach mode never touches the controller, so the local runtime only
+	 * needs the hugepage heap the imported qpairs draw their request pools
+	 * from. UIO_LUT provides that without a vfio container. */
+	err = _rte_init(XNVME_BE_UPCIE_MODE_UIO_LUT, &dev->opts);
+	if (err) {
+		XNVME_DEBUG("FAILED: _rte_init()");
+		errno = -err;
+		return NULL;
+	}
+
+	ctrlr = calloc(1, sizeof(*ctrlr));
+	if (!ctrlr) {
+		errno = ENOMEM;
+		return NULL;
+	}
+	ctrlr->handout = true;
+
+	ctrlr->adesc = calloc(1, sizeof(*ctrlr->adesc));
+	if (!ctrlr->adesc) {
+		errno = ENOMEM;
+		goto err_ctrlr;
+	}
+
+	err = upcie_attach_read(attach_path, ctrlr->adesc);
+	if (err) {
+		XNVME_DEBUG("FAILED: upcie_attach_read('%s'); err(%d)", attach_path, err);
+		errno = -err;
+		goto err_adesc;
+	}
+	if (ctrlr->adesc->nqpairs < 1) {
+		XNVME_DEBUG("FAILED: attach descriptor has no qpairs");
+		errno = EINVAL;
+		goto err_adesc;
+	}
+
+	err = pci_func_open(ctrlr->adesc->bdf, &ctrlr->func);
+	if (err) {
+		XNVME_DEBUG("FAILED: pci_func_open('%s'); err(%d)", ctrlr->adesc->bdf, err);
+		errno = -err;
+		goto err_adesc;
+	}
+	err = pci_bar_map(ctrlr->func.bdf, 0, &ctrlr->func.bars[0]);
+	if (err) {
+		XNVME_DEBUG("FAILED: pci_bar_map(BAR0); err(%d)", err);
+		errno = -err;
+		goto err_bars;
+	}
+	bar0 = ctrlr->func.bars[0].region;
+
+	ctrlr->timeout_ms = nvme_reg_cap_get_to(nvme_mmio_cap_read(bar0)) * 500;
+	if (ctrlr->timeout_ms <= 0) {
+		ctrlr->timeout_ms = 5000;
+	}
+
+	err = hostmem_hugepage_import(ctrlr->adesc->region_path, &ctrlr->region,
+				      &g_upcie_rte.mem.config);
+	if (err) {
+		XNVME_DEBUG("FAILED: hostmem_hugepage_import('%s'); err(%d)",
+			    ctrlr->adesc->region_path, err);
+		errno = -err;
+		goto err_bars;
+	}
+
+	err = nvme_qpair_import(&ctrlr->sync, &ctrlr->adesc->qpairs[0], ctrlr->region.virt, bar0,
+				&g_upcie_rte.mem.heap, &ctrlr->sync_offsets.prp);
+	if (err) {
+		XNVME_DEBUG("FAILED: nvme_qpair_import(sync); err(%d)", err);
+		errno = -err;
+		goto err_region;
+	}
+	ctrlr->next_qpair = 1;
+
+	snprintf(dev->ident.kernel_driver, sizeof(dev->ident.kernel_driver), "upcie-attach");
+
+	g_ctrlr_count++;
+
+	return ctrlr;
+
+err_region:
+	hostmem_hugepage_free(&ctrlr->region);
+err_bars:
+	pci_func_close(&ctrlr->func);
+err_adesc:
+	free(ctrlr->adesc);
+err_ctrlr:
+	free(ctrlr);
+	return NULL;
+}
+
 /**
  * Close a controller the way it was opened, and detach its type1 group.
  *
@@ -404,6 +533,9 @@ _ctrlr_close(struct xnvme_be_upcie_ctrlr *ctrlr)
  * Initializes the runtime environment, allocates a shared xnvme_be_upcie_ctrlr,
  * opens the NVMe controller and creates a sync qpair. The returned handle is
  * stored in cref and written to dev->be.state[0] by the platform.
+ *
+ * When XNVME_UPCIE_ATTACH names an attach descriptor, attaches to a controller
+ * owned by another process instead (see _ctrlr_attach_init).
  */
 void *
 xnvme_be_upcie_ctrlr_init(struct xnvme_dev *dev)
@@ -412,7 +544,12 @@ xnvme_be_upcie_ctrlr_init(struct xnvme_dev *dev)
 	char driver_name[sizeof(dev->ident.kernel_driver)] = {0};
 	enum xnvme_be_upcie_mode mode = XNVME_BE_UPCIE_MODE_UNSET;
 	char cdev_path[PATH_MAX] = {0};
+	const char *attach_path = getenv("XNVME_UPCIE_ATTACH");
 	int err;
+
+	if (attach_path && attach_path[0]) {
+		return _ctrlr_attach_init(dev, attach_path);
+	}
 
 	err = xnvme_be_upcie_get_driver_name(dev->ident.uri, driver_name, sizeof(driver_name));
 	if (err) {
@@ -470,6 +607,7 @@ xnvme_be_upcie_ctrlr_init(struct xnvme_dev *dev)
 			errno = -err;
 			goto failed;
 		}
+		ctrlr->timeout_ms = ctrlr->ctrl->timeout_ms;
 		g_ctrlr_count++;
 		return ctrlr;
 	}
@@ -544,6 +682,7 @@ xnvme_be_upcie_ctrlr_init(struct xnvme_dev *dev)
 		atomic_store_explicit(&ctrlr->mproc.shm->is_initialized, true,
 				      memory_order_release);
 	}
+	ctrlr->timeout_ms = ctrlr->ctrl->timeout_ms;
 
 	g_ctrlr_count++;
 
@@ -571,6 +710,21 @@ xnvme_be_upcie_ctrlr_term(void *handle)
 {
 	struct xnvme_be_upcie_ctrlr *ctrlr = handle;
 	int is_secondary = g_upcie_rte.mproc && !g_upcie_rte.mproc->is_primary;
+
+	if (ctrlr->handout) {
+		nvme_qpair_import_term(&ctrlr->sync, &g_upcie_rte.mem.heap,
+				       ctrlr->sync_offsets.prp);
+		pci_func_close(&ctrlr->func);
+		hostmem_hugepage_free(&ctrlr->region);
+		free(ctrlr->adesc);
+		free(ctrlr);
+
+		if (--g_ctrlr_count == 0) {
+			_rte_term();
+		}
+
+		return 0;
+	}
 
 	if (is_secondary) {
 		xnvme_be_upcie_mproc_delete_io_qpair(ctrlr, &ctrlr->sync, &ctrlr->sync_offsets);
@@ -647,19 +801,38 @@ _publish_nqueues(struct xnvme_dev *dev, struct xnvme_be_upcie_state *state)
 	shm->ncq_max = ncq;
 }
 
+static int
+_dbuf_write_host(void *dbuf, size_t offset, const void *src, size_t nbytes)
+{
+	if (src) {
+		memcpy((uint8_t *)dbuf + offset, src, nbytes);
+	} else {
+		memset((uint8_t *)dbuf + offset, 0, nbytes);
+	}
+
+	return 0;
+}
+
 int
 xnvme_be_upcie_dev_open(struct xnvme_dev *dev)
 {
 	struct xnvme_be_upcie_state *state = (void *)dev->be.state;
+	uint32_t nsid = dev->opts.nsid;
 
-	dev->ident.dtype =
-		dev->opts.nsid ? XNVME_DEV_TYPE_NVME_NAMESPACE : XNVME_DEV_TYPE_NVME_CONTROLLER;
+	/* In attach mode the consumer need not know the namespace id; default it
+	 * from the descriptor's geometry so geometry derivation has a namespace. */
+	if (!nsid && state->ctrlr && state->ctrlr->handout && state->ctrlr->adesc) {
+		nsid = state->ctrlr->adesc->nsid;
+	}
+
+	dev->ident.dtype = nsid ? XNVME_DEV_TYPE_NVME_NAMESPACE : XNVME_DEV_TYPE_NVME_CONTROLLER;
 	dev->ident.csi = XNVME_SPEC_CSI_NVM;
-	dev->ident.nsid = dev->opts.nsid;
+	dev->ident.nsid = nsid;
 
 	/* Data buffers come off the host heap; the GPU backends override this with
 	 * their device heap once their runtime is up. */
 	state->dmem = &g_upcie_rte.mem.dmem;
+	state->dbuf_write = _dbuf_write_host;
 
 	_publish_nqueues(dev, state);
 

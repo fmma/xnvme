@@ -17,6 +17,26 @@ xnvme_be_upcie_queue_init(struct xnvme_queue *queue, int XNVME_UNUSED(opts))
 	struct xnvme_be_upcie_state *state = (void *)queue->base.dev->be.state;
 	int err;
 
+	if (state->ctrlr->handout) {
+		// Attach mode: take a pre-created qpair from the owner's pool. Its
+		// ring depth is fixed by the owner, so the caller's capacity must fit.
+		err = xnvme_be_upcie_attach_get_qpair(state->ctrlr, &upcie_queue->qpair,
+						      &upcie_queue->offsets.prp);
+		if (err) {
+			XNVME_DEBUG("FAILED: xnvme_be_upcie_attach_get_qpair()");
+			return err;
+		}
+		if (upcie_queue->qpair.depth <= queue->base.capacity) {
+			XNVME_DEBUG("FAILED: attach qpair depth(%u) <= capacity(%u)",
+				    upcie_queue->qpair.depth, queue->base.capacity);
+			nvme_qpair_import_term(&upcie_queue->qpair, &g_upcie_rte.mem.heap,
+					       upcie_queue->offsets.prp);
+			return -EINVAL;
+		}
+		return 0;
+	}
+
+
 	if (g_upcie_rte.mproc) {
 		err = xnvme_be_upcie_mproc_create_io_qpair(state->ctrlr, &upcie_queue->qpair,
 							   queue->base.capacity + 1,
@@ -44,7 +64,10 @@ xnvme_be_upcie_queue_term(struct xnvme_queue *queue)
 	struct xnvme_queue_upcie *upcie_queue = (void *)queue;
 	struct xnvme_be_upcie_state *state = (void *)queue->base.dev->be.state;
 
-	if (g_upcie_rte.mproc) {
+	if (state->ctrlr->handout) {
+		nvme_qpair_import_term(&upcie_queue->qpair, &g_upcie_rte.mem.heap,
+				       upcie_queue->offsets.prp);
+	} else if (g_upcie_rte.mproc) {
 		xnvme_be_upcie_mproc_delete_io_qpair(state->ctrlr, &upcie_queue->qpair,
 						     &upcie_queue->offsets);
 	} else {

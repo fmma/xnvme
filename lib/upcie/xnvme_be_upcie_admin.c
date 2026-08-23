@@ -11,6 +11,56 @@
 #include <xnvme_spec.h>
 #include <xnvme_be_upcie.h>
 
+/**
+ * Serve admin commands in attach mode, where there is no admin queue.
+ *
+ * Only Identify is meaningfully supported: the Controller/Namespace payloads
+ * the owner captured are returned from the descriptor so geometry derivation
+ * succeeds. The active-namespace list is synthesised from the single namespace
+ * the descriptor describes. Other admin commands return a zeroed buffer and
+ * success so geometry derivation does not hard-fail on optional probes.
+ */
+static int
+_attach_cmd_admin(struct xnvme_cmd_ctx *ctx, void *dbuf, size_t dbuf_nbytes)
+{
+	struct xnvme_be_upcie_state *state = (void *)ctx->dev->be.state;
+	struct upcie_attach_desc *adesc = state->ctrlr->adesc;
+	uint8_t opc = ctx->cmd.common.opcode;
+	uint8_t cns;
+
+	memset(&ctx->cpl, 0, sizeof(ctx->cpl));
+
+	if (opc != XNVME_SPEC_ADM_OPC_IDFY) {
+		if (dbuf && dbuf_nbytes) {
+			state->dbuf_write(dbuf, 0, NULL, dbuf_nbytes);
+		}
+		return 0;
+	}
+
+	if (!dbuf || dbuf_nbytes < UPCIE_ATTACH_IDFY_NBYTES) {
+		XNVME_DEBUG("FAILED: attach idfy dbuf too small (%zu)", dbuf_nbytes);
+		return -EINVAL;
+	}
+
+	cns = (uint8_t)ctx->cmd.idfy.cns;
+	switch (cns) {
+	case XNVME_SPEC_IDFY_NS:
+		return state->dbuf_write(dbuf, 0, adesc->idfy_ns, UPCIE_ATTACH_IDFY_NBYTES);
+	case XNVME_SPEC_IDFY_CTRLR:
+		return state->dbuf_write(dbuf, 0, adesc->idfy_ctrlr, UPCIE_ATTACH_IDFY_NBYTES);
+	case 0x02: ///< Active Namespace ID list
+		state->dbuf_write(dbuf, 0, NULL, dbuf_nbytes);
+		return state->dbuf_write(dbuf, 0, &adesc->nsid, sizeof(adesc->nsid));
+	default:
+		/* Command-set-specific (ZONED/FS) and other identifies are not
+		 * synthesised. Report a command error like a conventional
+		 * controller so geometry derivation does not treat a zeroed
+		 * buffer as a valid response and read it. */
+		ctx->cpl.status.sc = 0x02; ///< Invalid Field in Command
+		return 0;
+	}
+}
+
 int
 xnvme_be_upcie_sync_cmd_admin(struct xnvme_cmd_ctx *ctx, void *dbuf, size_t dbuf_nbytes,
 			      void *XNVME_UNUSED(mbuf), size_t XNVME_UNUSED(mbuf_nbytes))
@@ -22,6 +72,10 @@ xnvme_be_upcie_sync_cmd_admin(struct xnvme_cmd_ctx *ctx, void *dbuf, size_t dbuf
 	struct nvme_completion *cpl = (struct nvme_completion *)&ctx->cpl;
 	struct nvme_request *req;
 	int err;
+
+	if (ctrlr->handout) {
+		return _attach_cmd_admin(ctx, dbuf, dbuf_nbytes);
+	}
 
 	err = xnvme_be_upcie_ctrlr_mutex_lock(ctrlr);
 	if (err) {
