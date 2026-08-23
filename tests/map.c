@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include <errno.h>
+#include <stdlib.h>
+#include <string.h>
 #include <libxnvme.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -68,6 +70,57 @@ test_mem_map_unmap(struct xnvme_cli *cli)
 	return nerr ? -ENOMEM : 0;
 }
 
+/**
+ * A metadata buffer the runtime was never told about must be refused
+ *
+ * Memory outside the registry translates to zero, so submitting anyway points
+ * the controller at physical address zero, which without an IOMMU is host
+ * memory it may write.
+ *
+ * Writes rather than reads on purpose: without the check a write has the
+ * controller read address zero where a read has it write there.
+ */
+static int
+test_mptr_unregistered(struct xnvme_cli *cli)
+{
+	struct xnvme_dev *dev = cli->args.dev;
+	const struct xnvme_geo *geo = xnvme_dev_get_geo(dev);
+	struct xnvme_cmd_ctx ctx = xnvme_cmd_ctx_from_dev(dev);
+	uint32_t nsid = xnvme_dev_get_nsid(dev);
+	void *dbuf = NULL, *mbuf = NULL;
+	int err;
+
+	dbuf = xnvme_buf_alloc(dev, geo->lba_nbytes);
+	if (!dbuf) {
+		xnvme_cli_perr("xnvme_buf_alloc()", -errno);
+		return -errno;
+	}
+	memset(dbuf, 0, geo->lba_nbytes);
+
+	/* Deliberately not xnvme_buf_alloc(): the whole point is memory the
+	 * runtime has no record of */
+	mbuf = malloc(geo->nbytes_oob ? geo->nbytes_oob : 4096);
+	if (!mbuf) {
+		xnvme_cli_perr("malloc()", -errno);
+		xnvme_buf_free(dev, dbuf);
+		return -errno;
+	}
+
+	err = xnvme_nvm_write(&ctx, nsid, 0x0, 0, dbuf, mbuf);
+
+	free(mbuf);
+	xnvme_buf_free(dev, dbuf);
+
+	if (!err && !xnvme_cmd_ctx_cpl_status(&ctx)) {
+		xnvme_cli_pinf("FAILED: the command was accepted with an unregistered mbuf");
+		return -EIO;
+	}
+
+	xnvme_cli_pinf("LGTM: refused with err(%d)", err);
+
+	return 0;
+}
+
 //
 // Command-Line Interface (CLI) definition
 //
@@ -83,6 +136,18 @@ static struct xnvme_cli_sub g_subs[] = {
 
 			{XNVME_CLI_OPT_NON_POSA_TITLE, XNVME_CLI_SKIP},
 			{XNVME_CLI_OPT_COUNT, XNVME_CLI_LREQ},
+
+			XNVME_CLI_ADMIN_OPTS,
+		},
+	},
+	{
+		"mptr_unregistered",
+		"Submit with a metadata buffer that is not registered",
+		"Submit with a metadata buffer that is not registered",
+		test_mptr_unregistered,
+		{
+			{XNVME_CLI_OPT_POSA_TITLE, XNVME_CLI_SKIP},
+			{XNVME_CLI_OPT_URI, XNVME_CLI_POSA},
 
 			XNVME_CLI_ADMIN_OPTS,
 		},
