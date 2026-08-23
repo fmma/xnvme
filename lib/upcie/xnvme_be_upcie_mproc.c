@@ -2,8 +2,7 @@
 //
 // SPDX-License-Identifier: BSD-3-Clause
 
-/* Also needed by the stubs below, which report -ENOSYS where multi-process
- * mode is unavailable; only Linux picks it up transitively. */
+/* The stubs below need this too, and only Linux picks it up transitively */
 #include <errno.h>
 #include <libxnvme.h>
 #include <xnvme_be.h>
@@ -18,20 +17,13 @@
 /**
  * Take, test, or drop the runtime role-election lock
  *
- * OFD locks rather than flock(), because only fcntl() can ask whether a lock
- * is held without taking it first. That matters for more than tidiness: a
- * probe that took the lock, even for the microseconds between acquiring and
- * releasing it, would make a process electing at that instant see the runtime
- * as claimed and demote itself to secondary, where it waits for a primary that
- * never arrives. Testing has to be non-destructive or the probe changes what
- * it observes.
- *
- * Both of the runtime's locks use this, the per-runtime one that elects the
- * role and the per-controller one that says who owns a device, so there is one
- * locking mechanism to reason about rather than two with different semantics.
+ * OFD rather than flock(), because only fcntl() can ask whether a lock is held
+ * without taking it. A probe that took it, even briefly, would make a process
+ * electing at that instant demote itself and wait for a primary that never
+ * arrives.
  *
  * Returns 1 when F_OFD_GETLK finds the lock held, 0 on success, negative errno
- * on failure. The lock is released when the descriptor is closed.
+ * on failure. Released when the descriptor closes.
  */
 static int
 _rte_lock_op(int fd, int cmd, short type)
@@ -97,11 +89,10 @@ xnvme_be_upcie_mproc_rte_term()
 /**
  * Refuse a segment this build cannot read
  *
- * The size check that precedes this catches a segment shorter than what gets
- * mapped, but not one whose layout differs at the same size or larger; that
- * one is read at this build's offsets and quietly misreported. The stamp is
- * what makes the refusal reliable. A zeroed stamp is a segment mid-creation
- * rather than a foreign one, so it is worth retrying instead of reporting.
+ * The preceding size check misses a segment whose layout differs at the same
+ * size or larger, which is then read at this build's offsets and quietly
+ * misreported. A zeroed stamp is mid-creation rather than foreign, so it is
+ * worth retrying.
  */
 static int
 _shm_stamp_check(uint32_t magic, uint32_t version)
@@ -133,11 +124,8 @@ xnvme_be_upcie_mproc_rte_init(int shm_id)
 
 	mproc->is_primary = true;
 
-	/* Role election, decided by an OFD lock so that a probe can ask who
-	 * holds it without taking it. The lock is released when the descriptor
-	 * closes, including when the process dies without cleaning up, which is
-	 * what lets a killed primary be told apart from a live one.
-	 */
+	/* The lock closing with the process is what tells a killed primary from
+	 * a live one */
 
 	snprintf(mproc->lock_name, sizeof(mproc->lock_name), XNVME_BE_UPCIE_RTE_LOCK_FMT, shm_id);
 	mproc->lock_fd = open(mproc->lock_name, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
@@ -217,10 +205,8 @@ xnvme_be_upcie_mproc_rte_init(int shm_id)
 	} else {
 		close(shm_fd);
 
-		/* Attaching is where a layout mismatch does damage, since what
-		 * follows writes through this mapping. Refuse a segment this
-		 * build cannot read rather than interpreting it at our own
-		 * offsets. */
+		/* Checked before attaching, since what follows writes through
+		 * this mapping */
 		err = _shm_stamp_check(mproc->shm->magic, mproc->shm->version);
 		if (err) {
 			UPCIE_DEBUG("FAILED: segment(%s) is not ours; err(%d)", mproc->shm_name,
@@ -370,17 +356,32 @@ xnvme_be_upcie_ctrlr_mutex_unlock(struct xnvme_be_upcie_ctrlr *ctrlr)
 	pthread_mutex_unlock(&shm->aq_mutex);
 }
 
+/**
+ * Turn a BDF into a key usable in both a path and a POSIX shm name
+ *
+ * A shm name may contain no '/' beyond the leading one, and a path keyed on a
+ * raw BDF is at the mercy of what the filesystem makes of ':' and '.'.
+ */
 static void
-xnvme_be_upcie_shm_bdf_name(const char *bdf, char *buf, size_t buflen)
+xnvme_be_upcie_bdf_key(const char *bdf, char *buf, size_t buflen)
 {
 	int i;
 
-	snprintf(buf, buflen, "/xnvme-upcie-%s", bdf);
-	for (i = 1; buf[i]; i++) {
+	snprintf(buf, buflen, "%s", bdf);
+	for (i = 0; buf[i]; i++) {
 		if (buf[i] == ':' || buf[i] == '.' || buf[i] == '/') {
 			buf[i] = '-';
 		}
 	}
+}
+
+static void
+xnvme_be_upcie_shm_bdf_name(const char *bdf, char *buf, size_t buflen)
+{
+	char key[XNVME_IDENT_URI_LEN];
+
+	xnvme_be_upcie_bdf_key(bdf, key, sizeof(key));
+	snprintf(buf, buflen, XNVME_BE_UPCIE_DEV_SHM_FMT, key);
 }
 
 void
@@ -401,11 +402,8 @@ xnvme_be_upcie_mproc_free_all_queues(struct xnvme_be_upcie_ctrlr *ctrlr)
 		return;
 	}
 
-	/* Counted in a wider type than the qid itself: the bitmap spans
-	 * NVME_QID_BITMAP_WORDS * BITS_PER_WORD entries, which can exceed what
-	 * a uint16_t holds, and such a counter would then never reach the bound
-	 * and would wrap instead. Stop at the highest qid the allocator admits,
-	 * which is what the bitmap exists to track. */
+	/* Wider than the qid itself: the bitmap spans more entries than a
+	 * uint16_t can reach, so such a counter wraps instead of terminating */
 	for (uint32_t qid = 1; qid < NVME_QID_MAX; ++qid) {
 		if (nvme_qid_is_allocated(shm->ctrl.qids, (uint16_t)qid)) {
 			struct nvme_command cmd = {0};
@@ -436,10 +434,8 @@ xnvme_be_upcie_mproc_free_all_queues(struct xnvme_be_upcie_ctrlr *ctrlr)
 /**
  * Record that this primary holds `uri`, so a probe can enumerate the group
  *
- * Only the primary reaches here, from the path that opens a controller, so the
- * write needs no lock beyond the one already excluding other primaries: the
- * runtime is a process-wide global and opening devices from several threads at
- * once is unsupported for reasons older than this.
+ * Needs no lock beyond the one already excluding other primaries: opening
+ * devices from several threads is unsupported for reasons older than this.
  */
 static void
 _ctrlr_register(const char *uri)
@@ -452,8 +448,7 @@ _ctrlr_register(const char *uri)
 	}
 	shm = g_upcie_rte.mproc->shm;
 
-	/* Counted whether or not it fits, so a probe can say how many are held
-	 * rather than silently showing a truncated list as the whole of it. */
+	/* Counted whether or not it fits, so truncation is visible */
 	shm->nctrlrs_held++;
 
 	nctrlrs = atomic_load_explicit(&shm->nctrlrs, memory_order_relaxed);
@@ -464,8 +459,8 @@ _ctrlr_register(const char *uri)
 
 	snprintf(shm->ctrlrs[nctrlrs], sizeof(shm->ctrlrs[0]), "%s", uri);
 
-	/* Released after the bytes it covers, so a reader that sees the count
-	 * sees the URI too. */
+	/* Released after the bytes it covers, so a reader seeing the count sees
+	 * the URI too */
 	atomic_store_explicit(&shm->nctrlrs, nctrlrs + 1, memory_order_release);
 }
 
@@ -495,7 +490,7 @@ _ctrlr_unregister(const char *uri)
 		}
 
 		/* Shrunk before the bytes move, so a reader never counts a slot
-		 * that is being overwritten as it reads. */
+		 * being overwritten */
 		atomic_store_explicit(&shm->nctrlrs, nctrlrs - 1, memory_order_release);
 
 		if (i != (nctrlrs - 1)) {
@@ -548,7 +543,7 @@ xnvme_be_upcie_mproc_ctrlr_shm_init(struct xnvme_dev *dev, struct xnvme_be_upcie
 				    const char *driver_name)
 {
 	struct xnvme_be_upcie_ctrlr_shm *shm;
-	char shm_name[64];
+	char shm_name[64], bdf_key[XNVME_IDENT_URI_LEN];
 	size_t shm_size = sizeof(*shm);
 	int shm_fd = -1, lock_fd = -1, err;
 
@@ -556,8 +551,9 @@ xnvme_be_upcie_mproc_ctrlr_shm_init(struct xnvme_dev *dev, struct xnvme_be_upcie
 
 	/* Whether another primary has claimed this device, on the same kind of
 	 * lock the runtime elects with. */
+	xnvme_be_upcie_bdf_key(dev->ident.uri, bdf_key, sizeof(bdf_key));
 	snprintf(ctrlr->mproc.lock_name, sizeof(ctrlr->mproc.lock_name),
-		 "/tmp/xnvme-upcie-%s-lock", dev->ident.uri);
+		 XNVME_BE_UPCIE_DEV_LOCK_FMT, bdf_key);
 	ctrlr->mproc.lock_fd = -1;
 
 	lock_fd = open(ctrlr->mproc.lock_name, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
@@ -705,9 +701,8 @@ xnvme_be_upcie_mproc_ctrlr_shm_attach(struct xnvme_dev *dev, struct xnvme_be_upc
 	close(shm_fd);
 	shm_fd = -1;
 
-	/* Attaching is where a layout mismatch does damage, since the fields
-	 * read below and the queues set up through them are interpreted at this
-	 * build's offsets. */
+	/* Checked before attaching, since the queues below are set up through
+	 * fields read at this build's offsets */
 	err = _shm_stamp_check(shm->magic, shm->version);
 	if (err) {
 		UPCIE_DEBUG("FAILED: segment(%s) is not ours; err(%d)", shm_name, err);
@@ -978,8 +973,7 @@ xnvme_mproc_primary_alive(uint32_t shm_id)
 /**
  * Read the runtime segment for `shm_id` without attaching to it
  *
- * Same discipline as xnvme_mproc_get_ctrlr_info(): mapped read-only, no lock, a
- * snapshot that may be a moment stale.
+ * Mapped read-only, no lock, a snapshot that may be a moment stale.
  */
 int
 xnvme_mproc_get_info(uint32_t shm_id, struct xnvme_mproc_info *info)
@@ -1044,9 +1038,8 @@ xnvme_mproc_get_info(uint32_t shm_id, struct xnvme_mproc_info *info)
 /**
  * Read the shared controller segment without attaching to it
  *
- * Maps the segment read-only and reads a snapshot. No lock is taken: the
- * counts are advisory, and a monitoring caller that blocked the processes it
- * is monitoring would be worse than one reporting a value a moment stale.
+ * No lock is taken: a monitoring caller that blocked what it monitors would be
+ * worse than one reporting a value a moment stale.
  */
 int
 xnvme_mproc_get_ctrlr_info(const char *uri, struct xnvme_mproc_ctrlr_info *info)
@@ -1068,10 +1061,8 @@ xnvme_mproc_get_ctrlr_info(const char *uri, struct xnvme_mproc_ctrlr_info *info)
 		return -errno;
 	}
 
-	/* A segment written by a build with a different layout can be shorter
-	 * than what is mapped here, and reading past its end faults rather than
-	 * failing. Refuse it instead: a stale segment is a mismatch to report,
-	 * not a crash to take. */
+	/* A shorter segment from another build would fault rather than fail on
+	 * the read past its end */
 	if (fstat(shm_fd, &st)) {
 		err = -errno;
 		close(shm_fd);
@@ -1102,9 +1093,8 @@ xnvme_mproc_get_ctrlr_info(const char *uri, struct xnvme_mproc_ctrlr_info *info)
 	info->nattached = (uint32_t)atomic_load(&shm->refcount);
 	info->initialized = atomic_load(&shm->is_initialized) ? 1 : 0;
 
-	/* The bitmap is all zeroes until the primary marks the admin queue in
-	 * use, a window this call can land in and reports as uninitialized.
-	 * Subtracting the admin queue unconditionally would wrap it to 4G. */
+	/* Zero until the primary marks the admin queue, a window this can land
+	 * in; subtracting it unconditionally would wrap to 4G */
 	qids_used = nvme_qid_used(shm->ctrl.qids);
 	info->nsq_used = qids_used ? qids_used - 1 : 0;
 	info->ncq_used = info->nsq_used;

@@ -54,10 +54,9 @@ enum xnvme_be_upcie_mode {
 /**
  * Identifies a segment as one this build can read.
  *
- * A size check alone cannot do it: a segment written by a build whose layout
- * differs but whose size matches, or grew, is read at this build's offsets and
- * silently misinterpreted. Bump the version whenever either segment's layout
- * changes.
+ * A size check alone cannot: a differing layout at the same size, or larger,
+ * is read at this build's offsets and silently misinterpreted. Bump the
+ * version whenever either segment's layout changes.
  */
 #define XNVME_BE_UPCIE_SHM_MAGIC   0x49435055 ///< 'UPCI' little-endian
 #define XNVME_BE_UPCIE_SHM_VERSION 1
@@ -65,12 +64,18 @@ enum xnvme_be_upcie_mode {
 /**
  * Names of the runtime's two per-shm_id objects, keyed on shm_id
  *
- * Kept here rather than spelled out at each use, so the role-election lock and
- * the segment have one definition between the code that creates them and the
- * code that probes them.
  */
 #define XNVME_BE_UPCIE_RTE_LOCK_FMT "/tmp/xnvme-upcie-lock-%d"
 #define XNVME_BE_UPCIE_RTE_SHM_FMT  "/xnvme-upcie-shm-%d"
+
+/**
+ * Names of a controller's two objects, keyed on its sanitized BDF
+ *
+ * Sanitized because the key lands in a filesystem path as well as in a POSIX
+ * shm name.
+ */
+#define XNVME_BE_UPCIE_DEV_LOCK_FMT "/tmp/xnvme-upcie-lock-%s"
+#define XNVME_BE_UPCIE_DEV_SHM_FMT  "/xnvme-upcie-shm-%s"
 
 /**
  * Per-controller shared segment
