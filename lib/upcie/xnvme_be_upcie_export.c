@@ -285,4 +285,59 @@ xnvme_be_upcie_admin(struct xnvme_dev *dev, void *cmd, void *cpl)
 
 	return nvme_qpair_submit_sync(&ctrl->aq, cmd, ctrl->timeout_ms, cpl);
 }
+
+/**
+ * Allocate from the heap on a client's behalf
+ *
+ * A client cannot allocate here itself: the free list is a chain of this
+ * process's addresses and has no lock. It asks and receives an offset, which
+ * is what its own mapping resolves against.
+ *
+ * @param nbytes How much the client asked for
+ * @param offset Set to where the memory begins in the heap
+ *
+ * @return 0 on success, negative errno on error
+ */
+int
+xnvme_be_upcie_alloc_buf(size_t nbytes, uint64_t *offset)
+{
+	size_t at;
+	int err;
+
+	if (!nbytes || !offset) {
+		return -EINVAL;
+	}
+	if (!g_upcie_rte.mem.heap_alive) {
+		return -ENOTCONN;
+	}
+
+	err = dmamem_heap_alloc(&g_upcie_rte.mem.heap, nbytes, &at);
+	if (err) {
+		XNVME_DEBUG("FAILED: dmamem_heap_alloc(%zu); err(%d)", nbytes, err);
+		return err;
+	}
+
+	*offset = at;
+
+	return 0;
+}
+
+/**
+ * Free memory allocated for a client
+ *
+ * @param offset An offset from xnvme_be_upcie_alloc_buf()
+ *
+ * @return 0 on success, negative errno on error
+ */
+int
+xnvme_be_upcie_free_buf(uint64_t offset)
+{
+	if (!g_upcie_rte.mem.heap_alive) {
+		return -ENOTCONN;
+	}
+
+	dmamem_heap_free(&g_upcie_rte.mem.heap, offset);
+
+	return 0;
+}
 #endif

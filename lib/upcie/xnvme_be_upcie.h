@@ -182,6 +182,12 @@ xnvme_be_upcie_free_ioqpair(struct xnvme_dev *dev, uint32_t qid);
 int
 xnvme_be_upcie_admin(struct xnvme_dev *dev, void *cmd, void *cpl);
 
+int
+xnvme_be_upcie_alloc_buf(size_t nbytes, uint64_t *offset);
+
+int
+xnvme_be_upcie_free_buf(uint64_t offset);
+
 /**
  * Per-runtime shared segment (one per shm_id)
  *

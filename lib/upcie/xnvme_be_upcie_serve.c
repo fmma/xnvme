@@ -45,11 +45,15 @@
 #define SERVE_DEVS_MAX 16
 #define SERVE_IOQPAIRS_PER_CLIENT 8
 
+#define SERVE_ALLOCS_PER_CLIENT 32
+
 struct serve_client {
 	int sock;
 	int dev; ///< Index into the server's device list; what this client attached to
 	uint32_t qids[SERVE_IOQPAIRS_PER_CLIENT];
 	int nqids;
+	uint64_t allocs[SERVE_ALLOCS_PER_CLIENT]; ///< Heap offsets handed out
+	int nallocs;
 };
 
 /**
@@ -88,11 +92,22 @@ serve_dev_path(const char *base, const char *bdf, char *path, size_t nbytes)
 static void
 serve_client_release(struct xnvme_dev *dev, struct serve_client *client)
 {
+	/* Queues first: the controller has to stop being able to reach an
+	 * address before that address stops meaning anything. */
 	for (int i = 0; i < client->nqids; ++i) {
 		int err = xnvme_be_upcie_free_ioqpair(dev, client->qids[i]);
 
 		if (err) {
 			XNVME_DEBUG("FAILED: ungrant(qid(%u)); err(%d)", client->qids[i], err);
+		}
+	}
+
+	for (int i = 0; i < client->nallocs; ++i) {
+		int err = xnvme_be_upcie_free_buf(client->allocs[i]);
+
+		if (err) {
+			XNVME_DEBUG("FAILED: reclaim(0x%" PRIx64 "); err(%d)", client->allocs[i],
+				    err);
 		}
 	}
 
@@ -171,6 +186,36 @@ serve_one(struct xnvme_dev *dev, struct serve_client *client,
 
 			reply.status = xnvme_be_upcie_free_ioqpair(dev, msg.u.release.qid);
 			client->qids[i] = client->qids[--client->nqids];
+			break;
+		}
+		break;
+
+	case NVME_CPLANE_OP_ALLOC_BUF: {
+		uint64_t offset = 0;
+
+		if (client->nallocs == SERVE_ALLOCS_PER_CLIENT) {
+			reply.status = -ENOSPC;
+			break;
+		}
+
+		reply.status = xnvme_be_upcie_alloc_buf(msg.u.mem.nbytes, &offset);
+		if (reply.status) {
+			break;
+		}
+
+		client->allocs[client->nallocs++] = offset;
+		reply.u.mem.offset = offset;
+	} break;
+
+	case NVME_CPLANE_OP_FREE_BUF:
+		reply.status = -ENOENT;
+		for (int i = 0; i < client->nallocs; ++i) {
+			if (client->allocs[i] != msg.u.mem.offset) {
+				continue;
+			}
+
+			reply.status = xnvme_be_upcie_free_buf(msg.u.mem.offset);
+			client->allocs[i] = client->allocs[--client->nallocs];
 			break;
 		}
 		break;
