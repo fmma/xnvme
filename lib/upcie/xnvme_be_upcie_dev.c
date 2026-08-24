@@ -228,7 +228,7 @@ _rte_init_vfio_type1(size_t heap_size)
  * type1-container paths cannot do.
  */
 static int
-_rte_init(enum xnvme_be_upcie_mode mode, struct xnvme_opts *opts)
+_rte_init(enum xnvme_be_upcie_mode mode, struct xnvme_opts *opts, const char *bdf)
 {
 	size_t heap_size = opts->host_heap_size;
 	int err;
@@ -252,6 +252,25 @@ _rte_init(enum xnvme_be_upcie_mode mode, struct xnvme_opts *opts)
 	}
 
 	g_upcie_rte.mode = mode;
+
+	/* Zero is a descriptor, so an unattached runtime has to say so with
+	 * something that is not one. */
+	g_upcie_rte.attached.sock = -1;
+
+	if (opts->shm_id) {
+		/* Somebody may already own this identifier. Attaching to them
+		 * is cheaper than allocating a runtime and then discovering
+		 * they exist, and it is what makes the socket the way in. */
+		err = xnvme_be_upcie_attach(opts->shm_id, bdf);
+		if (!err) {
+			g_upcie_rte.is_initialized = 1;
+			return 0;
+		}
+		if (err != -ENOENT) {
+			XNVME_DEBUG("FAILED: xnvme_be_upcie_attach(); err(%d)", err);
+			return err;
+		}
+	}
 
 	switch (mode) {
 	case XNVME_BE_UPCIE_MODE_VFIO_CDEV:
@@ -432,7 +451,7 @@ xnvme_be_upcie_ctrlr_init(struct xnvme_dev *dev)
 		return NULL;
 	}
 
-	err = _rte_init(mode, &dev->opts);
+	err = _rte_init(mode, &dev->opts, dev->ident.uri);
 	if (err) {
 		XNVME_DEBUG("FAILED: _rte_init(mode(%d))", mode);
 		errno = -err;

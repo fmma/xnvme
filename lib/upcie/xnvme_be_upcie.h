@@ -182,6 +182,21 @@ xnvme_be_upcie_free_ioqpair(struct xnvme_dev *dev, uint32_t qid);
 int
 xnvme_be_upcie_admin(struct xnvme_dev *dev, void *cmd, void *cpl);
 
+void
+xnvme_be_upcie_socket_path(uint32_t shm_id, const char *bdf, char *path, size_t nbytes);
+
+int
+xnvme_be_upcie_ask(struct nvme_cplane_msg *msg, int *fds, uint32_t *nfds);
+
+int
+xnvme_be_upcie_attach(uint32_t shm_id, const char *bdf);
+
+int
+xnvme_be_upcie_query(uint32_t shm_id, const char *bdf, struct nvme_cplane_msg *msg);
+
+void
+xnvme_be_upcie_detach(void);
+
 int
 xnvme_be_upcie_alloc_buf(size_t nbytes, uint64_t *offset);
 
@@ -258,12 +273,29 @@ struct xnvme_be_upcie_rte_mem {
 	int heap_alive; ///< Whether heap is initialized
 };
 
+/**
+ * This process's view of a runtime another process owns
+ *
+ * Empty in the process that owns one. `sock` is what the server watches: it
+ * closing is how a client's queues and allocs come back.
+ */
+struct xnvme_be_upcie_rte_attached {
+	int sock;                                 ///< To the server; -1 when not attached
+	int alive;                                ///< Whether the rest of this means anything
+	void *heap_base;                          ///< This process's mapping of the heap
+	uint64_t heap_nbytes;                     ///< How much of it
+	void *bar0;                               ///< This process's mapping of BAR0
+	uint64_t bar0_nbytes;                     ///< How much of it
+	const struct nvme_runtime_record *record; ///< In the heap, written by the server
+};
+
 struct xnvme_be_upcie_rte {
 	enum xnvme_be_upcie_mode mode;
 	struct xnvme_be_upcie_rte_cdev cdev;
 	struct xnvme_be_upcie_rte_type1 type1;
 	struct xnvme_be_upcie_rte_mem mem;
-	struct xnvme_be_upcie_mproc *mproc; ///< NULL when not in multi-process mode
+	struct xnvme_be_upcie_mproc *mproc;          ///< NULL when not in multi-process mode
+	struct xnvme_be_upcie_rte_attached attached; ///< Set when another process owns this
 	int is_initialized;
 };
 
