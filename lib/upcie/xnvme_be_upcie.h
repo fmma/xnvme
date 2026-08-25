@@ -108,6 +108,7 @@ struct xnvme_be_upcie_ctrlr {
 	struct nvme_qpair sync; ///< Shared submission/completion queue for synchronous IOs
 	struct xnvme_be_upcie_qpair_offsets sync_offsets; ///< Heap offsets of the sync qpair
 	struct xnvme_be_upcie_ctrlr_mproc mproc;
+	struct nvme_request admin_prp; ///< PRP scratch for admin payloads, this controller's own
 };
 
 /**
@@ -214,6 +215,12 @@ xnvme_be_upcie_attach_qpair(struct nvme_qpair *qpair, uint16_t depth);
  */
 struct nvme_qpair *
 xnvme_be_upcie_ctrlr_ioq(struct xnvme_be_upcie_ctrlr *ctrlr);
+
+struct nvme_request *
+xnvme_be_upcie_ctrlr_admin_prp(struct xnvme_be_upcie_ctrlr *ctrlr);
+
+void
+xnvme_be_upcie_ctrlr_admin_prp_release(struct xnvme_be_upcie_ctrlr *ctrlr);
 
 void
 xnvme_be_upcie_detach_qpair(struct nvme_qpair *qpair);
@@ -439,5 +446,14 @@ xnvme_be_upcie_mproc_create_io_qpair(struct xnvme_be_upcie_ctrlr *ctrlr, struct 
 void
 xnvme_be_upcie_mproc_delete_io_qpair(struct xnvme_be_upcie_ctrlr *ctrlr, struct nvme_qpair *qpair,
 				     const struct xnvme_be_upcie_qpair_offsets *offsets);
+
+// DMA buffers, from the heap this process owns or the one it attached to
+// (xnvme_be_upcie_mem.c)
+
+void *
+xnvme_be_upcie_buf_alloc(const struct xnvme_dev *dev, size_t nbytes, uint64_t *phys);
+
+void
+xnvme_be_upcie_buf_free(const struct xnvme_dev *dev, void *buf);
 
 #endif /* __INTERNAL_XNVME_BE_UPCIE */

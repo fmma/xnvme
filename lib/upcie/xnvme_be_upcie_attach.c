@@ -383,6 +383,54 @@ xnvme_be_upcie_ctrlr_ioq(struct xnvme_be_upcie_ctrlr *ctrlr)
 }
 
 /**
+ * The controller's PRP scratch for admin payloads, allocated on first need
+ *
+ * There is one admin queue and it is shared, so what an admin command needs in
+ * order to describe a payload is a single page, held for as long as the
+ * controller is. An I/O queue is dedicated to the client holding it, so taking
+ * one for this made a process pay for a queue it may never submit I/O on.
+ *
+ * Only payloads spanning more than two pages reach the list itself; smaller
+ * ones are described by the command's own PRP fields and never come here.
+ *
+ * @return A request whose PRP list is this controller's, NULL with errno set
+ * where the page could not be allocated.
+ */
+struct nvme_request *
+xnvme_be_upcie_ctrlr_admin_prp(struct xnvme_be_upcie_ctrlr *ctrlr)
+{
+	if (!ctrlr) {
+		errno = EINVAL;
+		return NULL;
+	}
+	if (ctrlr->admin_prp.prp) {
+		return &ctrlr->admin_prp;
+	}
+
+	ctrlr->admin_prp.prp = xnvme_be_upcie_buf_alloc(NULL, 4096, &ctrlr->admin_prp.prp_addr);
+	if (!ctrlr->admin_prp.prp) {
+		XNVME_DEBUG("FAILED: allocating admin PRP scratch; errno(%d)", errno);
+		return NULL;
+	}
+
+	return &ctrlr->admin_prp;
+}
+
+/**
+ * Give back the admin PRP scratch, where one was ever taken
+ */
+void
+xnvme_be_upcie_ctrlr_admin_prp_release(struct xnvme_be_upcie_ctrlr *ctrlr)
+{
+	if (!ctrlr || !ctrlr->admin_prp.prp) {
+		return;
+	}
+
+	xnvme_be_upcie_buf_free(NULL, ctrlr->admin_prp.prp);
+	memset(&ctrlr->admin_prp, 0, sizeof(ctrlr->admin_prp));
+}
+
+/**
  * Hand a allocated queue back and release what was built around it
  *
  * @param qpair A queue pair from xnvme_be_upcie_attach_qpair()

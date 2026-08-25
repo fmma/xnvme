@@ -626,6 +626,7 @@ xnvme_be_upcie_ctrlr_term(void *handle)
 		 * of the description. The controller itself is the server's and
 		 * is not closed here; the BAR mapping goes with the runtime,
 		 * not with this. */
+		xnvme_be_upcie_ctrlr_admin_prp_release(ctrlr);
 		xnvme_be_upcie_detach_qpair(&ctrlr->sync);
 		free(ctrlr->ctrl);
 		free(ctrlr);
