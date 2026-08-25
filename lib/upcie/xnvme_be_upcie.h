@@ -198,6 +198,15 @@ void
 xnvme_be_upcie_detach(void);
 
 int
+xnvme_be_upcie_attach_ctrlr(struct nvme_controller *ctrl);
+
+int
+xnvme_be_upcie_attach_qpair(struct nvme_qpair *qpair, uint16_t depth);
+
+void
+xnvme_be_upcie_detach_qpair(struct nvme_qpair *qpair);
+
+int
 xnvme_be_upcie_alloc_buf(size_t nbytes, uint64_t *offset);
 
 int
