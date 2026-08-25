@@ -394,11 +394,21 @@ class MprocServer:
         if MprocServer.RUNNING == (be, tuple(labels)):
             return
 
-        uris = " ".join(d["uri"] for d in cijoe_config_get_all_devices(labels))
+        devices = cijoe_config_get_all_devices(labels)
+        uris = " ".join(d["uri"] for d in devices)
         if not uris:
             pytest.skip(f"Configuration has no device labelled: {labels}")
 
         XnvmeDriver.kernel_detach(cijoe)
+
+        # A backend that cannot open the device at all on this machine is not a
+        # defect in what is under test, and a server that fails for that reason
+        # tells us nothing. Ask first, so that the environment produces a skip
+        # while a server that cannot start over devices that do open produces a
+        # failure.
+        err, _ = cijoe.run(f"xnvme info {devices[0]['uri']} --be {be}")
+        if err:
+            pytest.skip(f"be({be}) cannot open {devices[0]['uri']} on this machine")
 
         # SPDK backs its DMA memory with files in the hugetlbfs mount and never unlinks
         # them, since clients must be able to map them. As xNVMe does not call
@@ -408,10 +418,15 @@ class MprocServer:
         cijoe.run(f"rm -f {mount_point}/spdk*map_*")
 
         # 'stdbuf -oL' keeps the readiness marker from sitting in libc's fully-buffered
-        # stdout while the server parks waiting for a signal
+        # stdout while the server parks waiting for a signal.
+        #
+        # 'setsid' and the closed stdin are what let this run against a remote
+        # target: nohup alone leaves the server holding the transport's
+        # channel, so the command never returns and the server is reported as
+        # not running. Harmless where the target is localhost.
         cijoe.run(
-            f"stdbuf -oL nohup homi start {uris} --be {be} --shm_id {_shm_id} "
-            f"> /tmp/mproc_{be}.out 2>&1 &"
+            f"setsid stdbuf -oL homi start {uris} --be {be} --shm_id {_shm_id} "
+            f"< /dev/null > /tmp/mproc_{be}.out 2>&1 &"
         )
 
         # Opening a device takes about a second, so waiting a fixed duration either
@@ -430,6 +445,18 @@ class MprocServer:
 
         MprocServer.RUNNING = (be, tuple(labels))
         MprocServer.CIJOE = cijoe
+
+    @staticmethod
+    def forget():
+        """
+        Drop the record of a server that is already gone
+
+        For a testcase that ended the server itself, where stop() has nothing
+        left to ask for or wait on. The next testcase to want one starts it.
+        """
+
+        MprocServer.RUNNING = None
+        MprocServer.CIJOE = None
 
     @staticmethod
     def stop(cijoe):

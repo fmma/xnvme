@@ -60,7 +60,48 @@ xnvme_mproc_get_info(uint32_t shm_id, struct xnvme_mproc_info *info)
 	/* The count is of clients; whoever answered is one more. */
 	info->nattached = msg.u.status.nconsumers + 1;
 
-	if (msg.u.status.bdf[0]) {
+	/* The runtime-wide reply names one controller, since the protocol has
+	 * room for one. The rest are found by asking the per-controller sockets,
+	 * which is also what says whether each is being served. */
+	{
+		char prefix[64] = {0};
+		struct dirent *entry;
+		DIR *dir;
+
+		snprintf(prefix, sizeof(prefix), "xnvme-homi-%u-", shm_id);
+
+		dir = opendir("/tmp");
+		if (!dir) {
+			return -errno;
+		}
+
+		while ((entry = readdir(dir))) {
+			struct nvme_cplane_msg per = {0};
+			char path[256] = {0};
+
+			if (strncmp(entry->d_name, prefix, strlen(prefix))) {
+				continue;
+			}
+
+			snprintf(path, sizeof(path), "/tmp/%s", entry->d_name);
+			if (xnvme_be_upcie_query_path(path, &per) || !per.u.status.bdf[0]) {
+				continue;
+			}
+
+			info->nctrlrs_held++;
+			if (info->nctrlrs >= XNVME_MPROC_MAX_CTRLRS) {
+				continue;
+			}
+
+			snprintf(info->ctrlrs[info->nctrlrs], sizeof(info->ctrlrs[0]), "%s",
+				 per.u.status.bdf);
+			info->nctrlrs++;
+		}
+
+		closedir(dir);
+	}
+
+	if (!info->nctrlrs && msg.u.status.bdf[0]) {
 		info->nctrlrs = 1;
 		info->nctrlrs_held = 1;
 		snprintf(info->ctrlrs[0], sizeof(info->ctrlrs[0]), "%s", msg.u.status.bdf);
@@ -88,12 +129,19 @@ xnvme_mproc_get_ctrlr_info(const char *uri, struct xnvme_mproc_ctrlr_info *info)
 
 	while ((entry = readdir(dir))) {
 		struct nvme_cplane_msg msg = {0};
+		char path[256] = {0};
 		unsigned int shm_id;
 
-		if (sscanf(entry->d_name, "xnvme-homi-%u.sock", &shm_id) != 1) {
+		/* Both shapes: the runtime-wide socket for a server holding one
+		 * controller, and the per-controller ones beside it. Which
+		 * answered does not matter; the reply names what it holds. */
+		if ((sscanf(entry->d_name, "xnvme-homi-%u.sock", &shm_id) != 1) &&
+		    (sscanf(entry->d_name, "xnvme-homi-%u-", &shm_id) != 1)) {
 			continue;
 		}
-		if (xnvme_be_upcie_query((uint32_t)shm_id, NULL, &msg)) {
+
+		snprintf(path, sizeof(path), "/tmp/%s", entry->d_name);
+		if (xnvme_be_upcie_query_path(path, &msg)) {
 			continue;
 		}
 		if (strcmp(msg.u.status.bdf, uri)) {

@@ -216,15 +216,22 @@ failed:
 int
 xnvme_be_upcie_query(uint32_t shm_id, const char *bdf, struct nvme_cplane_msg *msg)
 {
-	struct sockaddr_un addr = {.sun_family = AF_UNIX};
 	char path[256] = {0};
-	int sock, err;
-
-	if (!msg) {
-		return -EINVAL;
-	}
 
 	xnvme_be_upcie_socket_path(shm_id, bdf, path, sizeof(path));
+
+	return xnvme_be_upcie_query_path(path, msg);
+}
+
+int
+xnvme_be_upcie_query_path(const char *path, struct nvme_cplane_msg *msg)
+{
+	struct sockaddr_un addr = {.sun_family = AF_UNIX};
+	int sock, err;
+
+	if (!path || !msg) {
+		return -EINVAL;
+	}
 
 	sock = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (sock < 0) {

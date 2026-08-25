@@ -79,6 +79,83 @@ While it runs, other processes attach as clients by passing the same
 xnvme info 0000:03:00.0 --be upcie --shm_id 1
 ```
 
+## `status`: Report whether a server is running
+
+```{literalinclude} homi_status_usage.out
+:language: bash
+```
+
+Answers whether anything is holding controllers, without opening a device:
+
+```bash
+homi status --shm_id 1
+```
+
+It reports whether a server is holding controllers under that id and, when
+one is, what it holds: how many processes are attached to each controller, how
+many I/O submission and completion queues are in use, and how many the
+controller allocated. It exits zero only when a server is running and every
+controller it holds has finished coming up, so it can be used as a readiness
+or health check without parsing its output.
+
+It reports on the uPCIe backend only, and exists only where that backend does,
+which is Linux and only when it was built in. Elsewhere the subcommand refuses
+rather than reporting: **homi** itself still runs, since `--be spdk` is
+multi-process capable on other platforms, but its bookkeeping is not somewhere
+this can read. Where uPCIe is present and a runtime belongs to another
+backend, that runtime likewise reads as absent rather than as running.
+
+Output is YAML, matching the rest of xNVMe, since the caller is as likely to
+be a monitoring loop as a person:
+
+```yaml
+shm_id: 9
+server_running: true
+attached: 3
+controllers:
+  - uri: '0000:03:00.0'
+    readable: true
+    initialized: true
+    attached: 2
+    nsq_used: 6
+    ncq_used: 6
+    nsq_total: 16
+    ncq_total: 16
+ready: true
+```
+
+The top-level `attached` counts the processes sharing the runtime, the server
+included, so a server holding controllers for two clients reads as three.
+`ready` is what the exit status follows: it is false while a server holds the
+role but its controllers are still coming up, which is a window a service
+manager would otherwise mistake for being up.
+
+`nsq_used` and `ncq_used` are necessarily equal: a queue pair is created as
+one submission and one completion queue sharing a queue identifier, and the
+identifier is what is tracked. They are reported separately so each reads
+against its own total. The totals are the queues the controller has allocated,
+which need not agree, and the smaller is what limits queue pairs; both are
+given rather than their minimum so it is visible which one binds. They are
+omitted entirely when the controller did not report them, since absent says
+unknown where zero would say none.
+
+What it inspects is whoever is serving that identifier. It connects to the
+runtime's socket and asks, which answers most of the question by succeeding: a
+socket that answers has the process holding the controllers behind it. Nothing
+is opened, nothing is locked, and nothing is inferred from what a process left
+in memory.
+
+That removes a distinction the previous arrangement needed. A server that was
+killed left a shared segment behind which read exactly like a live runtime, so
+status had to report whether what it found was debris. There is nothing to
+tell apart now: the process that holds the socket is the only thing that
+answers on it, and when it dies the name stops working.
+
+The queue totals are read once when the server brings a controller up, with
+Get Features (Number of Queues). Set Features would let a driver ask for a
+larger allocation, but the drives tested here reject it, so what is reported
+is the allocation the controller made on its own.
+
 ## Backends
 
 **homi** works with any backend that advertises the multi-process capability,
@@ -97,7 +174,7 @@ default would take VRAM away from the clients:
 homi start 0000:03:00.0 --be upcie-cuda --shm_id 1
 ```
 
-`homi status` is the exception: it reads uPCIe's shared segment directly, so a
+`homi status` is the exception: it asks over the socket uPCIe serves, so a
 server started with `--be spdk` reads as absent rather than as running, and on
 a platform without uPCIe the subcommand refuses outright. The same applies to
 the systemd unit, whose readiness gate is that command.

@@ -162,6 +162,16 @@ xnvme_be_upcie_attach(uint32_t shm_id, const char *bdf);
 int
 xnvme_be_upcie_query(uint32_t shm_id, const char *bdf, struct nvme_cplane_msg *msg);
 
+/**
+ * Ask whoever is listening on `path` what they are holding
+ *
+ * The path rather than the identifier, so that a caller enumerating the
+ * per-controller sockets can ask each without reversing the controller's name
+ * out of the file name.
+ */
+int
+xnvme_be_upcie_query_path(const char *path, struct nvme_cplane_msg *msg);
+
 void
 xnvme_be_upcie_detach(void);
 
