@@ -203,6 +203,18 @@ xnvme_be_upcie_attach_ctrlr(struct nvme_controller *ctrl);
 int
 xnvme_be_upcie_attach_qpair(struct nvme_qpair *qpair, uint16_t depth);
 
+/**
+ * The controller's I/O queue for this process, asked for if it has none yet
+ *
+ * An I/O queue is dedicated to whoever holds it, so an attached process takes
+ * one only when it has something to submit. The admin queue is not this: that
+ * one is the server's and shared, and commands for it travel over the socket.
+ *
+ * @return The queue on success, NULL on failure with errno set.
+ */
+struct nvme_qpair *
+xnvme_be_upcie_ctrlr_ioq(struct xnvme_be_upcie_ctrlr *ctrlr);
+
 void
 xnvme_be_upcie_detach_qpair(struct nvme_qpair *qpair);
 

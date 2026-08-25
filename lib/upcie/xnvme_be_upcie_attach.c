@@ -346,6 +346,43 @@ xnvme_be_upcie_attach_qpair(struct nvme_qpair *qpair, uint16_t depth)
 }
 
 /**
+ * The controller's I/O queue for this process, asked for if it has none yet
+ *
+ * Deferred rather than taken at open: an I/O queue is dedicated to the
+ * client holding it, so a process that only asks the controller about itself
+ * should not cost the server one. Where this process owns the controller the
+ * queue was created with it, and this hands that one back.
+ */
+struct nvme_qpair *
+xnvme_be_upcie_ctrlr_ioq(struct xnvme_be_upcie_ctrlr *ctrlr)
+{
+	int err;
+
+	if (!ctrlr) {
+		errno = EINVAL;
+		return NULL;
+	}
+	if (ctrlr->sync.rpool) {
+		return &ctrlr->sync;
+	}
+	if (!g_upcie_rte.attached.alive) {
+		/* The server builds its queue when it opens the controller, so
+		 * one missing here is a controller that never came up. */
+		errno = ENOTCONN;
+		return NULL;
+	}
+
+	err = xnvme_be_upcie_attach_qpair(&ctrlr->sync, 16);
+	if (err) {
+		XNVME_DEBUG("FAILED: xnvme_be_upcie_attach_qpair(); err(%d)", err);
+		errno = -err;
+		return NULL;
+	}
+
+	return &ctrlr->sync;
+}
+
+/**
  * Hand a allocated queue back and release what was built around it
  *
  * @param qpair A queue pair from xnvme_be_upcie_attach_qpair()

@@ -466,7 +466,7 @@ xnvme_be_upcie_ctrlr_init(struct xnvme_dev *dev)
 	/* Only the server writes the PCI Command register; the server already flipped
 	 * Bus Master Enable at open time and a client neither needs to nor typically
 	 * may touch config space. */
-	if (!g_upcie_rte.mproc || g_upcie_rte.mproc->is_primary) {
+	if (!g_upcie_rte.attached.alive && (!g_upcie_rte.mproc || g_upcie_rte.mproc->is_primary)) {
 		err = _pci_enable_bus_master(dev->ident.uri);
 		if (err) {
 			XNVME_DEBUG("FAILED: _pci_enable_bus_master(%s)", dev->ident.uri);
@@ -485,6 +485,31 @@ xnvme_be_upcie_ctrlr_init(struct xnvme_dev *dev)
 	ctrlr->attach.type1_group.fd = -1;
 	ctrlr->mproc.shm_fd = -1;
 	ctrlr->mproc.lock_fd = -1;
+
+	/* Attached: the controller is open in another process, so this builds a
+	 * description of it and asks that process for a queue to submit on. */
+	if (g_upcie_rte.attached.alive) {
+		ctrlr->ctrl = calloc(1, sizeof(*ctrlr->ctrl));
+		if (!ctrlr->ctrl) {
+			XNVME_DEBUG("FAILED: calloc(ctrl)");
+			errno = ENOMEM;
+			goto failed;
+		}
+
+		err = xnvme_be_upcie_attach_ctrlr(ctrlr->ctrl);
+		if (err) {
+			XNVME_DEBUG("FAILED: xnvme_be_upcie_attach_ctrlr(); err(%d)", err);
+			errno = -err;
+			goto failed;
+		}
+
+		/* No I/O queue yet: one is dedicated to whoever holds it, so it
+		 * is asked for on first use rather than at open. */
+
+		g_ctrlr_count++;
+
+		return ctrlr;
+	}
 
 	/* mproc client: skip open-and-initialize; attach to server's controller via shm. */
 	if (g_upcie_rte.mproc && !g_upcie_rte.mproc->is_primary) {
@@ -595,6 +620,22 @@ xnvme_be_upcie_ctrlr_term(void *handle)
 {
 	struct xnvme_be_upcie_ctrlr *ctrlr = handle;
 	int is_secondary = g_upcie_rte.mproc && !g_upcie_rte.mproc->is_primary;
+
+	if (g_upcie_rte.attached.alive) {
+		/* Hand the I/O queue back, if one was ever asked for, and let go
+		 * of the description. The controller itself is the server's and
+		 * is not closed here; the BAR mapping goes with the runtime,
+		 * not with this. */
+		xnvme_be_upcie_detach_qpair(&ctrlr->sync);
+		free(ctrlr->ctrl);
+		free(ctrlr);
+
+		if (--g_ctrlr_count == 0) {
+			_rte_term();
+		}
+
+		return 0;
+	}
 
 	if (is_secondary) {
 		xnvme_be_upcie_mproc_delete_io_qpair(ctrlr, &ctrlr->sync, &ctrlr->sync_offsets);
