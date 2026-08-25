@@ -1,6 +1,9 @@
 {
 	global:
 
+		# libxnvme_mproc.h
+		xnvme_mproc_serve;
+
 		# libxnvme_adm.h
 		xnvme_adm_idfy;
 		xnvme_adm_idfy_ctrlr;

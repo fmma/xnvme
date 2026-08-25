@@ -8,12 +8,12 @@
 
 #include <libxnvme.h>
 
-// The backend default (1GiB) is sized for a process doing I/O. HOMI only needs the
-// admin queue and the sync qpair that opening a device creates, so claiming the
-// default is overkill. Each of those two queue pairs carries a request pool of
-// NVME_REQUEST_POOL_LEN PRP pages, which is 4MiB apiece, so budget double the 8MiB
-// per device that costs.
-#define HOMI_HEAP_SIZE_PER_DEV (16ULL * 1024 * 1024)
+// This heap is the pool every client draws from, so it is sized for the I/O they
+// do rather than for what HOMI does itself. It used to be 16MiB, which was right when
+// a client brought its own memory: it now has none of its own, and asks for all of
+// it here, so the old figure left clients unable to allocate a working buffer.
+// Tunable with --host_heap_size for a machine with less to spare, or more to serve.
+#define HOMI_HEAP_SIZE_PER_DEV (64ULL * 1024 * 1024)
 
 // The GPU backends allocate a device heap for data buffers, which HOMI never allocates
 // from; only the control structures it does need live on the host heap. Claiming the
@@ -74,11 +74,24 @@ failed:
 	return err;
 }
 
+/**
+ * Where clients of a given shm_id find the server
+ *
+ * A filesystem path rather than an abstract name, since an abstract address
+ * cannot be reached from another network namespace and a containerised
+ * client is an ordinary case. /tmp for the same reason the role lock is
+ * there: every process sharing an shm_id has to see the same one.
+ */
 static void
-_wait_for_stop_signal(void)
+_socket_path(uint32_t shm_id, char *path, size_t nbytes)
+{
+	snprintf(path, nbytes, "/tmp/xnvme-homi-%u.sock", shm_id);
+}
+
+static void
+_install_stop_handler(void)
 {
 	struct sigaction sa = {0};
-	sigset_t mask, orig;
 
 	sa.sa_handler = handle_signal;
 	sa.sa_flags = 0;
@@ -86,6 +99,14 @@ _wait_for_stop_signal(void)
 	sigemptyset(&sa.sa_mask);
 	sigaction(SIGTERM, &sa, NULL);
 	sigaction(SIGINT, &sa, NULL);
+}
+
+static void
+_wait_for_stop_signal(void)
+{
+	sigset_t mask, orig;
+
+	_install_stop_handler();
 
 	// Block the stop-signals before testing 'stop', and let sigsuspend() unblock them only
 	// while parked, such that a signal arriving between the test and the wait cannot be lost
@@ -135,11 +156,27 @@ sub_start(struct xnvme_cli *cli)
 	}
 
 	xnvme_cli_pinf("HOMI started successfully, use Ctrl+C to stop");
-	_wait_for_stop_signal();
+
+	{
+		char path[256] = {0};
+
+		_socket_path(cli->args.shm_id, path, sizeof(path));
+		_install_stop_handler();
+
+		err = xnvme_mproc_serve(devs, ndevs, path, &stop);
+		if (err == -ENOSYS) {
+			/* Nothing to serve clients with here; hold the
+			 * controllers for the shared-segment path instead. */
+			err = 0;
+			_wait_for_stop_signal();
+		} else if (err) {
+			xnvme_cli_perr("xnvme_mproc_serve()", err);
+		}
+	}
 
 	_xnvme_dev_close_all(devs, ndevs);
 
-	return 0;
+	return err;
 }
 
 #else
