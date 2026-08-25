@@ -56,6 +56,18 @@ struct serve_client {
 	int nallocs;
 };
 
+/* What a status request reports. Counted rather than derived, because the
+ * answer is wanted while the loop is between polls. */
+static int serve_nclients;
+/**
+ * Queues handed out, per controller
+ *
+ * Per controller rather than per process: a server serving several would
+ * otherwise report the same number against each of them, which reads as every
+ * controller being as busy as the busiest.
+ */
+static int serve_nqueues[SERVE_DEVS_MAX];
+
 /**
  * Release everything a client held, queues before the memory behind them
  */
@@ -111,8 +123,11 @@ serve_client_release(struct xnvme_dev *dev, struct serve_client *client)
 		}
 	}
 
+	serve_nqueues[client->dev] -= client->nqids;
+
 	if (client->sock >= 0) {
 		close(client->sock);
+		serve_nclients--;
 	}
 
 	memset(client, 0, sizeof(*client));
@@ -169,6 +184,7 @@ serve_one(struct xnvme_dev *dev, struct serve_client *client,
 		}
 
 		client->qids[client->nqids++] = allocation.qid;
+		serve_nqueues[client->dev]++;
 
 		reply.u.queue.allocation.sq_offset = allocation.sq_offset;
 		reply.u.queue.allocation.cq_offset = allocation.cq_offset;
@@ -186,6 +202,7 @@ serve_one(struct xnvme_dev *dev, struct serve_client *client,
 
 			reply.status = xnvme_be_upcie_free_ioqpair(dev, msg.u.release.qid);
 			client->qids[i] = client->qids[--client->nqids];
+			serve_nqueues[client->dev]--;
 			break;
 		}
 		break;
@@ -218,6 +235,14 @@ serve_one(struct xnvme_dev *dev, struct serve_client *client,
 			client->allocs[i] = client->allocs[--client->nallocs];
 			break;
 		}
+		break;
+
+	case NVME_CPLANE_OP_STATUS:
+		/* Asking is not attaching, so whoever is asking does not count
+		 * itself among the clients. */
+		reply.u.status.nconsumers = (uint32_t)(serve_nclients - 1);
+		reply.u.status.nqueues = (uint32_t)serve_nqueues[client->dev];
+		snprintf(reply.u.status.bdf, sizeof(reply.u.status.bdf), "%s", exported->uri);
 		break;
 
 	case NVME_CPLANE_OP_ADMIN_CMD:
@@ -382,6 +407,7 @@ xnvme_mproc_serve(struct xnvme_dev **devs, int ndevs, const char *path,
 
 				clients[slot].sock = sock;
 				clients[slot].dev = listener_dev[l];
+				serve_nclients++;
 			}
 		}
 

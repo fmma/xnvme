@@ -2,6 +2,9 @@
 	global:
 
 		# libxnvme_mproc.h
+		xnvme_mproc_get_ctrlr_info;
+		xnvme_mproc_get_info;
+		xnvme_mproc_primary_alive;
 		xnvme_mproc_serve;
 
 		# libxnvme_adm.h

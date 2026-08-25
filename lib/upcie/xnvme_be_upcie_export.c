@@ -113,6 +113,7 @@ xnvme_be_upcie_export(struct xnvme_dev *dev, struct xnvme_be_upcie_export *out)
 	out->heap_nbytes = g_upcie_rte.mem.dmem.size;
 	out->record_offset = record_offset;
 	out->desc_offset = desc_offset;
+	snprintf(out->uri, sizeof(out->uri), "%s", dev->ident.uri);
 
 	return 0;
 

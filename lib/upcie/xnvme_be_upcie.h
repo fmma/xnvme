@@ -52,25 +52,6 @@ enum xnvme_be_upcie_mode {
 };
 
 /**
- * Per-controller shared segment
- *
- * One per physical controller, created by the server. Embeds the full
- * struct nvme_controller so clients can attach without re-initializing
- * the device. Pointer fields inside the embedded controller reference the
- * server's virtual address space; clients fix them up on attach by
- * the constant offset between their imported hugepage base and the
- * server's published base.
- */
-struct xnvme_be_upcie_ctrlr_shm {
-	_Atomic int32_t refcount;    ///< Number of processes currently attached
-	_Atomic bool is_initialized; ///< Set by server once the controller is fully opened
-	pthread_mutex_t aq_mutex;    ///< Process-shared mutex for admin queue access
-	char driver_name[32];
-	struct xnvme_be_upcie_qpair_offsets sync_offsets; ///< Heap offsets of the sync qpair
-	struct nvme_controller ctrl; ///< Embedded controller; pointer fields use server's VA
-};
-
-/**
  * How one controller is attached, one member per mode
  *
  * Which member carries state follows xnvme_be_upcie_rte.mode; the rest stay
@@ -86,20 +67,6 @@ struct xnvme_be_upcie_ctrlr_attach {
 };
 
 /**
- * Multi-process bookkeeping for one controller
- *
- * All of it is inert outside multi-process mode, where `shm` is NULL.
- */
-struct xnvme_be_upcie_ctrlr_mproc {
-	char lock_name[128];                  ///< Per-BDF server-election lock path
-	int lock_fd;                          ///< Owned by server while it holds the controller
-	char shm_name[64];                    ///< POSIX shm name for the per-controller segment
-	int shm_fd;                           ///< Owned by server; -1 in clients
-	struct xnvme_be_upcie_ctrlr_shm *shm; ///< Per-controller shm (NULL outside mproc)
-	size_t aq_rpool_prp_offset;           ///< Heap offset of a client's admin-rpool PRPs
-};
-
-/**
  * Shared controller state, one per physical controller, managed by cref.
  */
 struct xnvme_be_upcie_ctrlr {
@@ -107,7 +74,6 @@ struct xnvme_be_upcie_ctrlr {
 	struct xnvme_be_upcie_ctrlr_attach attach;
 	struct nvme_qpair sync; ///< Shared submission/completion queue for synchronous IOs
 	struct xnvme_be_upcie_qpair_offsets sync_offsets; ///< Heap offsets of the sync qpair
-	struct xnvme_be_upcie_ctrlr_mproc mproc;
 	struct nvme_request admin_prp; ///< PRP scratch for admin payloads, this controller's own
 };
 
@@ -144,6 +110,7 @@ struct xnvme_be_upcie_export {
 	uint64_t heap_nbytes;   ///< How much of the heap to map
 	uint64_t record_offset; ///< Where the runtime record sits
 	uint64_t desc_offset;   ///< Where the heap's description sits
+	char uri[32];           ///< The identifier clients were given
 };
 
 int
@@ -232,39 +199,6 @@ int
 xnvme_be_upcie_free_buf(uint64_t offset);
 
 /**
- * Per-runtime shared segment (one per shm_id)
- *
- * Created by the server. Carries the server's hugepage backing-file path
- * and virtual base so clients can import the same memory and reach the
- * admin queue by a constant VA offset. The refcount is advisory.
- */
-struct xnvme_be_upcie_mproc_shm {
-	char hugepage_path[256]; ///< Path to server's hugepage file
-	uint64_t hugepage_base;  ///< Server's hugepage virtual base for client pointer fixup
-	_Atomic int refcount;    ///< Number of processes currently attached
-	_Atomic bool is_initialized;
-};
-
-/**
- * Per-process multi-process state
- *
- * Populated by xnvme_be_upcie_mproc_rte_init when opts->shm_id != 0.
- * is_primary is decided by an advisory flock keyed on shm_id.
- */
-struct xnvme_be_upcie_mproc {
-	bool is_primary; ///< If true, this process owns the shared state
-
-	char lock_name[64];
-	int lock_fd;
-
-	char shm_name[64];
-	int shm_fd;
-	struct xnvme_be_upcie_mproc_shm *shm;
-
-	struct hostmem_hugepage *primary_hugepage; ///< Imported hugepage in a client
-};
-
-/**
  * State used across multiple instances of controllers/namespaces
  *
  * One dmamem_heap regardless of mode, so every controller allocates queues,
@@ -322,7 +256,6 @@ struct xnvme_be_upcie_rte {
 	struct xnvme_be_upcie_rte_cdev cdev;
 	struct xnvme_be_upcie_rte_type1 type1;
 	struct xnvme_be_upcie_rte_mem mem;
-	struct xnvme_be_upcie_mproc *mproc;          ///< NULL when not in multi-process mode
 	struct xnvme_be_upcie_rte_attached attached; ///< Set when another process owns this
 	int is_initialized;
 };
@@ -407,45 +340,6 @@ xnvme_be_upcie_sync_cmd_admin(struct xnvme_cmd_ctx *ctx, void *dbuf, size_t dbuf
 int
 xnvme_be_upcie_sync_cmd_pseudo(struct xnvme_cmd_ctx *ctx, void *dbuf, size_t dbuf_nbytes,
 			       void *mbuf, size_t mbuf_nbytes);
-
-// Multi-process runtime bring-up / teardown
-int
-xnvme_be_upcie_mproc_rte_init(int shm_id);
-void
-xnvme_be_upcie_mproc_rte_term(void);
-int
-xnvme_be_upcie_mproc_import_admin_hugepage(void);
-
-// Admin-queue mutex; no-op when not in multi-process mode
-int
-xnvme_be_upcie_ctrlr_mutex_lock(struct xnvme_be_upcie_ctrlr *ctrlr);
-void
-xnvme_be_upcie_ctrlr_mutex_unlock(struct xnvme_be_upcie_ctrlr *ctrlr);
-
-// Per-controller shared segment for the server/client handshake
-int
-xnvme_be_upcie_mproc_ctrlr_shm_init(struct xnvme_dev *dev, struct xnvme_be_upcie_ctrlr *ctrlr,
-				    const char *driver_name);
-int
-xnvme_be_upcie_mproc_ctrlr_shm_attach(struct xnvme_dev *dev, struct xnvme_be_upcie_ctrlr *ctrlr);
-void
-xnvme_be_upcie_mproc_ctrlr_shm_term(struct xnvme_be_upcie_ctrlr *ctrlr);
-void
-xnvme_be_upcie_mproc_free_all_queues(struct xnvme_be_upcie_ctrlr *ctrlr);
-
-// qids-bitmap lock; used by GPU-initiated queue create/destroy
-int
-xnvme_be_upcie_mproc_qids_lock(struct xnvme_be_upcie_ctrlr *ctrlr);
-void
-xnvme_be_upcie_mproc_qids_unlock(struct xnvme_be_upcie_ctrlr *ctrlr);
-
-// Mutex-guarded IO qpair create/delete on the dmamem heap
-int
-xnvme_be_upcie_mproc_create_io_qpair(struct xnvme_be_upcie_ctrlr *ctrlr, struct nvme_qpair *qpair,
-				     uint16_t depth, struct xnvme_be_upcie_qpair_offsets *offsets);
-void
-xnvme_be_upcie_mproc_delete_io_qpair(struct xnvme_be_upcie_ctrlr *ctrlr, struct nvme_qpair *qpair,
-				     const struct xnvme_be_upcie_qpair_offsets *offsets);
 
 // DMA buffers, from the heap this process owns or the one it attached to
 // (xnvme_be_upcie_mem.c)
