@@ -23,6 +23,28 @@ xnvme_be_upcie_buf_alloc(const struct xnvme_dev *XNVME_UNUSED(dev), size_t nbyte
 	void *buf;
 	int err;
 
+	if (g_upcie_rte.attached.alive) {
+		/* The allocator belongs to whoever owns the heap, so this asks
+		 * for an offset rather than taking one. */
+		struct nvme_cplane_msg msg = {0};
+
+		msg.op = NVME_CPLANE_OP_ALLOC_BUF;
+		msg.u.mem.nbytes = nbytes;
+
+		err = xnvme_be_upcie_ask(&msg, NULL, NULL);
+		if (err) {
+			errno = -err;
+			return NULL;
+		}
+
+		buf = (char *)g_upcie_rte.attached.heap_base + msg.u.mem.offset;
+		if (phys) {
+			*phys = dmamem_va_to_iova(&g_upcie_rte.mem.dmem, buf);
+		}
+
+		return buf;
+	}
+
 	err = dmamem_heap_alloc(&g_upcie_rte.mem.heap, nbytes, &offset);
 	if (err) {
 		errno = -err;
@@ -52,6 +74,19 @@ xnvme_be_upcie_buf_free(const struct xnvme_dev *XNVME_UNUSED(dev), void *buf)
 		return;
 	}
 	offset = (size_t)((char *)buf - (char *)g_upcie_rte.mem.dmem.cpu_va);
+
+	if (g_upcie_rte.attached.alive) {
+		struct nvme_cplane_msg msg = {0};
+
+		msg.op = NVME_CPLANE_OP_FREE_BUF;
+		msg.u.mem.offset = offset;
+
+		if (xnvme_be_upcie_ask(&msg, NULL, NULL)) {
+			XNVME_DEBUG("FAILED: giving back offset(0x%zx)", offset);
+		}
+
+		return;
+	}
 
 	dmamem_heap_free(&g_upcie_rte.mem.heap, offset);
 }
