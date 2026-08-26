@@ -528,6 +528,64 @@ def _wait_until(cijoe, shm_id, predicate, timeout):
 
 
 @xnvme_parametrize(labels=["pcie"], opts=["be"])
+def test_io_lands_on_the_controller_it_was_asked_for(cijoe, device, be_opts, cli_args):
+    """
+    A client holding several controllers submits each one's I/O on that one.
+
+    An attached client builds every controller it opens from what the server
+    published. Where that description comes from whichever controller the
+    client happened to open first, every device's I/O is submitted on that one:
+    the commands complete, the throughput looks plausible, and the rest of the
+    controllers sit idle.
+
+    So this asserts on where the queues appear rather than on whether the I/O
+    succeeded. The server counts them per controller, and a client submitting
+    to the wrong one cannot make that count look right.
+    """
+
+    _require_upcie(cijoe)
+
+    shm_id = get_shm_id()
+    if not shm_id:
+        pytest.skip(reason="Requires a multi-process server; pass --shm_id")
+    if not be_opts["be"].startswith("upcie"):
+        pytest.skip(
+            reason="status reads what the uPCIe runtime holds; others are opaque"
+        )
+
+    uris = _held_uris()
+    if len(uris) < 2:
+        pytest.skip(reason="Requires two controllers to tell one from the other")
+
+    pair = uris[:2]
+
+    cijoe.run(
+        "setsid xnvmeperf run " + " ".join(pair) + f" --be {be_opts['be']}"
+        f" --shm_id {shm_id} --iopattern randread --iosize 4096 --qdepth 8"
+        " --nqueues 1 --runtime 30 --cpulist 0 < /dev/null > /tmp/spread.out 2>&1 &"
+    )
+
+    # Two failures look alike in the counts, so tell them apart: a client that
+    # never reached the server leaves every controller at zero, which says
+    # nothing about placement
+    attached, used = _wait_until(
+        cijoe, shm_id, lambda u: any(u.get(uri, 0) > 0 for uri in pair), 30
+    )
+    if not attached:
+        cijoe.run("cat /tmp/spread.out")
+    assert attached, f"the client never took a queue from the server; saw {used}"
+
+    ok, used = _wait_until(
+        cijoe, shm_id, lambda u: all(u.get(uri, 0) > 0 for uri in pair), 20
+    )
+
+    assert ok, (
+        f"a client holding {pair} put queues on {used}. Every controller it"
+        " holds should carry its own, rather than one carrying all of them"
+    )
+
+
+@xnvme_parametrize(labels=["pcie"], opts=["be"])
 def test_consumers_come_and_go_across_controllers(cijoe, device, be_opts, cli_args):
     """
     Clients reach the controller they asked for, and give it back

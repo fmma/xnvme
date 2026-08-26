@@ -21,7 +21,8 @@ xnvme_be_upcie_queue_init(struct xnvme_queue *queue, int XNVME_UNUSED(opts))
 		/* The controller is another process's, so the queue is asked
 		 * for rather than created, and comes back as offsets this side
 		 * resolves for itself. */
-		err = xnvme_be_upcie_attach_qpair(&upcie_queue->qpair, queue->base.capacity + 1);
+		err = xnvme_be_upcie_attach_qpair(state->ctrlr, &upcie_queue->qpair,
+						  queue->base.capacity + 1);
 	} else {
 		err = nvme_controller_create_io_qpair_dmamem(
 			state->ctrlr->ctrl, &upcie_queue->qpair, queue->base.capacity + 1,
@@ -44,7 +45,7 @@ xnvme_be_upcie_queue_term(struct xnvme_queue *queue)
 	struct xnvme_be_upcie_state *state = (void *)queue->base.dev->be.state;
 
 	if (g_upcie_rte.attached.alive) {
-		xnvme_be_upcie_detach_qpair(&upcie_queue->qpair);
+		xnvme_be_upcie_detach_qpair(state->ctrlr, &upcie_queue->qpair);
 	} else {
 		nvme_controller_delete_io_qpair_dmamem(
 			state->ctrlr->ctrl, &upcie_queue->qpair, &g_upcie_rte.mem.heap,

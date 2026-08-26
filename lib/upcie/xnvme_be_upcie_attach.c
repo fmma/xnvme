@@ -78,13 +78,13 @@ xnvme_be_upcie_socket_path(uint32_t shm_id, const char *bdf, char *path, size_t 
  * @return 0 on success, the server's status when it refused, negative errno on error
  */
 int
-xnvme_be_upcie_ask(struct nvme_cplane_msg *msg, int *fds, uint32_t *nfds)
+xnvme_be_upcie_ask(int sock, struct nvme_cplane_msg *msg, int *fds, uint32_t *nfds)
 {
-	if (g_upcie_rte.attached.sock < 0) {
+	if (sock < 0) {
 		return -ENOTCONN;
 	}
 
-	return nvme_cplane_request(g_upcie_rte.attached.sock, msg, fds, nfds);
+	return nvme_cplane_request(sock, msg, fds, nfds);
 }
 
 /**
@@ -95,7 +95,7 @@ xnvme_be_upcie_ask(struct nvme_cplane_msg *msg, int *fds, uint32_t *nfds)
  * @return 0 on success, -ENOENT when nobody is serving, negative errno on error
  */
 int
-xnvme_be_upcie_attach(uint32_t shm_id, const char *bdf)
+xnvme_be_upcie_attach(uint32_t shm_id, const char *bdf, struct xnvme_be_upcie_ctrlr *ctrlr)
 {
 	struct sockaddr_un addr = {.sun_family = AF_UNIX};
 	struct nvme_cplane_msg msg = {0};
@@ -124,10 +124,8 @@ xnvme_be_upcie_attach(uint32_t shm_id, const char *bdf)
 		return (err == -ENOENT) || (err == -ECONNREFUSED) ? -ENOENT : err;
 	}
 
-	g_upcie_rte.attached.sock = sock;
-
 	msg.op = NVME_CPLANE_OP_ATTACH;
-	err = xnvme_be_upcie_ask(&msg, fds, &nfds);
+	err = xnvme_be_upcie_ask(sock, &msg, fds, &nfds);
 	if (err || (nfds != 2)) {
 		XNVME_DEBUG("FAILED: attach; err(%d) nfds(%u)", err, nfds);
 		/* Whatever arrived is installed in this process already, so it is
@@ -140,14 +138,21 @@ xnvme_be_upcie_attach(uint32_t shm_id, const char *bdf)
 		goto failed;
 	}
 
-	heap_base = mmap(NULL, msg.u.attach.heap_nbytes, PROT_READ | PROT_WRITE, MAP_SHARED,
-			 fds[0], 0);
-	close(fds[0]);
-	if (heap_base == MAP_FAILED) {
-		XNVME_DEBUG("FAILED: mmap(heap); errno(%d)", errno);
-		err = -errno;
-		close(fds[1]);
-		goto failed;
+	/* One heap per server, so the first controller maps it and the rest
+	 * take the mapping this process already has. */
+	if (g_upcie_rte.attached.alive) {
+		heap_base = g_upcie_rte.attached.heap_base;
+		close(fds[0]);
+	} else {
+		heap_base = mmap(NULL, msg.u.attach.heap_nbytes, PROT_READ | PROT_WRITE,
+				 MAP_SHARED, fds[0], 0);
+		close(fds[0]);
+		if (heap_base == MAP_FAILED) {
+			XNVME_DEBUG("FAILED: mmap(heap); errno(%d)", errno);
+			err = -errno;
+			close(fds[1]);
+			goto failed;
+		}
 	}
 
 	bar0 = mmap(NULL, msg.u.attach.bar0_nbytes, PROT_READ | PROT_WRITE, MAP_SHARED, fds[1], 0);
@@ -171,20 +176,33 @@ xnvme_be_upcie_attach(uint32_t shm_id, const char *bdf)
 	 * process could not, so it takes them from where they were left. */
 	desc = (const struct hostmem_shared_desc *)((char *)heap_base + record->desc_offset);
 
-	err = dmamem_from_shared_hostmem(&g_upcie_rte.mem.dmem, heap_base, desc,
-					 xnvme_be_upcie_va_bits());
-	if (err) {
-		XNVME_DEBUG("FAILED: dmamem_from_shared_hostmem(); err(%d)", err);
-		goto failed;
-	}
-	g_upcie_rte.mem.dmem_alive = 1;
+	if (!g_upcie_rte.attached.alive) {
+		err = dmamem_from_shared_hostmem(&g_upcie_rte.mem.dmem, heap_base, desc,
+						 xnvme_be_upcie_va_bits());
+		if (err) {
+			XNVME_DEBUG("FAILED: dmamem_from_shared_hostmem(); err(%d)", err);
+			goto failed;
+		}
+		g_upcie_rte.mem.dmem_alive = 1;
 
-	g_upcie_rte.attached.heap_base = heap_base;
-	g_upcie_rte.attached.heap_nbytes = msg.u.attach.heap_nbytes;
-	g_upcie_rte.attached.bar0 = bar0;
-	g_upcie_rte.attached.bar0_nbytes = msg.u.attach.bar0_nbytes;
-	g_upcie_rte.attached.record = record;
-	g_upcie_rte.attached.alive = 1;
+		g_upcie_rte.attached.heap_base = heap_base;
+		g_upcie_rte.attached.heap_nbytes = msg.u.attach.heap_nbytes;
+		g_upcie_rte.attached.alive = 1;
+	}
+
+	/* Without a controller to hand this to, the caller only wanted to know
+	 * whether anybody is serving, and to have the heap. */
+	if (!ctrlr) {
+		munmap(bar0, msg.u.attach.bar0_nbytes);
+		close(sock);
+
+		return 0;
+	}
+
+	ctrlr->sock = sock;
+	ctrlr->bar0 = bar0;
+	ctrlr->bar0_nbytes = msg.u.attach.bar0_nbytes;
+	ctrlr->record = record;
 
 	return 0;
 
@@ -192,11 +210,10 @@ failed:
 	if (bar0 != MAP_FAILED) {
 		munmap(bar0, msg.u.attach.bar0_nbytes);
 	}
-	if (heap_base != MAP_FAILED) {
+	if ((heap_base != MAP_FAILED) && !g_upcie_rte.attached.alive) {
 		munmap(heap_base, msg.u.attach.heap_nbytes);
 	}
-	close(g_upcie_rte.attached.sock);
-	g_upcie_rte.attached.sock = -1;
+	close(sock);
 
 	return err;
 }
@@ -267,19 +284,23 @@ xnvme_be_upcie_query_path(const char *path, struct nvme_cplane_msg *msg)
  * @return 0 on success, negative errno on error
  */
 int
-xnvme_be_upcie_attach_ctrlr(struct nvme_controller *ctrl)
+xnvme_be_upcie_attach_ctrlr(struct xnvme_be_upcie_ctrlr *ctrlr)
 {
-	const struct nvme_runtime_record *record = g_upcie_rte.attached.record;
+	const struct nvme_runtime_record *record;
+	struct nvme_controller *ctrl;
 
-	if (!ctrl || !g_upcie_rte.attached.alive) {
+	if (!ctrlr || !ctrlr->ctrl || !ctrlr->record) {
 		return -ENOTCONN;
 	}
+
+	ctrl = ctrlr->ctrl;
+	record = ctrlr->record;
 
 	memset(ctrl, 0, sizeof(*ctrl));
 	ctrl->timeout_ms = (int)record->timeout_ms;
 	ctrl->cc = record->cc;
-	ctrl->func.bars[0].region = g_upcie_rte.attached.bar0;
-	ctrl->func.bars[0].size = g_upcie_rte.attached.bar0_nbytes;
+	ctrl->func.bars[0].region = ctrlr->bar0;
+	ctrl->func.bars[0].size = ctrlr->bar0_nbytes;
 	ctrl->func.bars[0].fd = -1; ///< The server holds it
 	snprintf(ctrl->func.bdf, sizeof(ctrl->func.bdf), "%s", record->bdf);
 
@@ -298,36 +319,35 @@ xnvme_be_upcie_attach_ctrlr(struct nvme_controller *ctrl)
  * @return 0 on success, negative errno on error
  */
 int
-xnvme_be_upcie_attach_qpair(struct nvme_qpair *qpair, uint16_t depth)
+xnvme_be_upcie_attach_qpair(struct xnvme_be_upcie_ctrlr *ctrlr, struct nvme_qpair *qpair,
+			    uint16_t depth)
 {
 	struct nvme_cplane_msg msg = {0};
 	char *base = g_upcie_rte.attached.heap_base;
 	int dstrd, err;
 
-	if (!qpair || !g_upcie_rte.attached.alive) {
+	if (!qpair || !ctrlr || !ctrlr->bar0) {
 		return -ENOTCONN;
 	}
 
 	msg.op = NVME_CPLANE_OP_ALLOC_IOQPAIR;
 	msg.u.queue.depth = depth;
 
-	err = xnvme_be_upcie_ask(&msg, NULL, NULL);
+	err = xnvme_be_upcie_ask(ctrlr->sock, &msg, NULL, NULL);
 	if (err) {
 		XNVME_DEBUG("FAILED: asking for a queue; err(%d)", err);
 		return err;
 	}
 
-	dstrd = nvme_reg_cap_get_dstrd(nvme_mmio_cap_read(g_upcie_rte.attached.bar0));
+	dstrd = nvme_reg_cap_get_dstrd(nvme_mmio_cap_read(ctrlr->bar0));
 
 	memset(qpair, 0, sizeof(*qpair));
 	qpair->qid = msg.u.queue.allocation.qid;
 	qpair->depth = msg.u.queue.allocation.depth;
 	qpair->sq = base + msg.u.queue.allocation.sq_offset;
 	qpair->cq = base + msg.u.queue.allocation.cq_offset;
-	qpair->sqdb =
-		(char *)g_upcie_rte.attached.bar0 + 0x1000 + ((2 * qpair->qid) << (2 + dstrd));
-	qpair->cqdb =
-		(char *)g_upcie_rte.attached.bar0 + 0x1000 + ((2 * qpair->qid + 1) << (2 + dstrd));
+	qpair->sqdb = (char *)ctrlr->bar0 + 0x1000 + ((2 * qpair->qid) << (2 + dstrd));
+	qpair->cqdb = (char *)ctrlr->bar0 + 0x1000 + ((2 * qpair->qid + 1) << (2 + dstrd));
 	qpair->tail_last_written = UINT16_MAX;
 	qpair->phase = 1;
 
@@ -379,7 +399,7 @@ xnvme_be_upcie_ctrlr_ioq(struct xnvme_be_upcie_ctrlr *ctrlr)
 		return NULL;
 	}
 
-	err = xnvme_be_upcie_attach_qpair(&ctrlr->sync, 16);
+	err = xnvme_be_upcie_attach_qpair(ctrlr, &ctrlr->sync, 16);
 	if (err) {
 		XNVME_DEBUG("FAILED: xnvme_be_upcie_attach_qpair(); err(%d)", err);
 		errno = -err;
@@ -414,7 +434,8 @@ xnvme_be_upcie_ctrlr_admin_prp(struct xnvme_be_upcie_ctrlr *ctrlr)
 		return &ctrlr->admin_prp;
 	}
 
-	ctrlr->admin_prp.prp = xnvme_be_upcie_buf_alloc(NULL, 4096, &ctrlr->admin_prp.prp_addr);
+	ctrlr->admin_prp.prp =
+		xnvme_be_upcie_buf_alloc_on(ctrlr, 4096, &ctrlr->admin_prp.prp_addr);
 	if (!ctrlr->admin_prp.prp) {
 		XNVME_DEBUG("FAILED: allocating admin PRP scratch; errno(%d)", errno);
 		return NULL;
@@ -433,7 +454,7 @@ xnvme_be_upcie_ctrlr_admin_prp_release(struct xnvme_be_upcie_ctrlr *ctrlr)
 		return;
 	}
 
-	xnvme_be_upcie_buf_free(NULL, ctrlr->admin_prp.prp);
+	xnvme_be_upcie_buf_free_on(ctrlr, ctrlr->admin_prp.prp);
 	memset(&ctrlr->admin_prp, 0, sizeof(ctrlr->admin_prp));
 }
 
@@ -443,18 +464,18 @@ xnvme_be_upcie_ctrlr_admin_prp_release(struct xnvme_be_upcie_ctrlr *ctrlr)
  * @param qpair A queue pair from xnvme_be_upcie_attach_qpair()
  */
 void
-xnvme_be_upcie_detach_qpair(struct nvme_qpair *qpair)
+xnvme_be_upcie_detach_qpair(struct xnvme_be_upcie_ctrlr *ctrlr, struct nvme_qpair *qpair)
 {
 	struct nvme_cplane_msg msg = {0};
 
-	if (!qpair || !qpair->qid) {
+	if (!ctrlr || !qpair || !qpair->qid) {
 		return;
 	}
 
 	msg.op = NVME_CPLANE_OP_FREE_IOQPAIR;
 	msg.u.release.qid = qpair->qid;
 
-	if (xnvme_be_upcie_ask(&msg, NULL, NULL)) {
+	if (xnvme_be_upcie_ask(ctrlr->sock, &msg, NULL, NULL)) {
 		XNVME_DEBUG("FAILED: handing back qid(%u)", qpair->qid);
 	}
 
@@ -479,17 +500,10 @@ xnvme_be_upcie_detach(void)
 		dmamem_destroy(&g_upcie_rte.mem.dmem);
 		g_upcie_rte.mem.dmem_alive = 0;
 	}
-	if (g_upcie_rte.attached.bar0) {
-		munmap(g_upcie_rte.attached.bar0, g_upcie_rte.attached.bar0_nbytes);
-	}
 	if (g_upcie_rte.attached.heap_base) {
 		munmap(g_upcie_rte.attached.heap_base, g_upcie_rte.attached.heap_nbytes);
 	}
-	if (g_upcie_rte.attached.sock >= 0) {
-		close(g_upcie_rte.attached.sock);
-	}
 
 	memset(&g_upcie_rte.attached, 0, sizeof(g_upcie_rte.attached));
-	g_upcie_rte.attached.sock = -1;
 }
 #endif

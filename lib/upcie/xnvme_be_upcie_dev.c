@@ -254,15 +254,11 @@ _rte_init(enum xnvme_be_upcie_mode mode, struct xnvme_opts *opts, const char *bd
 
 	g_upcie_rte.mode = mode;
 
-	/* Zero is a descriptor, so an unattached runtime has to say so with
-	 * something that is not one. */
-	g_upcie_rte.attached.sock = -1;
-
 	if (opts->shm_id) {
 		/* Somebody may already own this identifier. Attaching to them
 		 * is cheaper than allocating a runtime and then discovering
 		 * they exist, and it is what makes the socket the way in. */
-		err = xnvme_be_upcie_attach(opts->shm_id, bdf);
+		err = xnvme_be_upcie_attach(opts->shm_id, bdf, NULL);
 		if (!err) {
 			g_upcie_rte.is_initialized = 1;
 			return 0;
@@ -440,6 +436,7 @@ xnvme_be_upcie_ctrlr_init(struct xnvme_dev *dev)
 	}
 
 	ctrlr->attach.type1_group.fd = -1;
+	ctrlr->sock = -1;
 
 	/* Attached: the controller is open in another process, so this builds a
 	 * description of it and asks that process for a queue to submit on. */
@@ -451,7 +448,15 @@ xnvme_be_upcie_ctrlr_init(struct xnvme_dev *dev)
 			goto failed;
 		}
 
-		err = xnvme_be_upcie_attach_ctrlr(ctrlr->ctrl);
+		err = xnvme_be_upcie_attach(dev->opts.shm_id, dev->ident.uri, ctrlr);
+		if (err) {
+			XNVME_DEBUG("FAILED: xnvme_be_upcie_attach(%s); err(%d)", dev->ident.uri,
+				    err);
+			errno = -err;
+			goto failed;
+		}
+
+		err = xnvme_be_upcie_attach_ctrlr(ctrlr);
 		if (err) {
 			XNVME_DEBUG("FAILED: xnvme_be_upcie_attach_ctrlr(); err(%d)", err);
 			errno = -err;
@@ -544,7 +549,13 @@ xnvme_be_upcie_ctrlr_term(void *handle)
 		 * is not closed here; the BAR mapping goes with the runtime,
 		 * not with this. */
 		xnvme_be_upcie_ctrlr_admin_prp_release(ctrlr);
-		xnvme_be_upcie_detach_qpair(&ctrlr->sync);
+		xnvme_be_upcie_detach_qpair(ctrlr, &ctrlr->sync);
+		if (ctrlr->bar0) {
+			munmap(ctrlr->bar0, ctrlr->bar0_nbytes);
+		}
+		if (ctrlr->sock >= 0) {
+			close(ctrlr->sock);
+		}
 		free(ctrlr->ctrl);
 		free(ctrlr);
 

@@ -17,7 +17,7 @@
  * attached; the caller hands the returned VA to the device as a PRP later.
  */
 void *
-xnvme_be_upcie_buf_alloc(const struct xnvme_dev *XNVME_UNUSED(dev), size_t nbytes, uint64_t *phys)
+xnvme_be_upcie_buf_alloc_on(struct xnvme_be_upcie_ctrlr *ctrlr, size_t nbytes, uint64_t *phys)
 {
 	size_t offset = 0;
 	void *buf;
@@ -31,7 +31,12 @@ xnvme_be_upcie_buf_alloc(const struct xnvme_dev *XNVME_UNUSED(dev), size_t nbyte
 		msg.op = NVME_CPLANE_OP_ALLOC_BUF;
 		msg.u.mem.nbytes = nbytes;
 
-		err = xnvme_be_upcie_ask(&msg, NULL, NULL);
+		if (!ctrlr) {
+			errno = EINVAL;
+			return NULL;
+		}
+
+		err = xnvme_be_upcie_ask(ctrlr->sock, &msg, NULL, NULL);
 		if (err) {
 			errno = -err;
 			return NULL;
@@ -66,7 +71,7 @@ xnvme_be_upcie_buf_alloc(const struct xnvme_dev *XNVME_UNUSED(dev), size_t nbyte
 }
 
 void
-xnvme_be_upcie_buf_free(const struct xnvme_dev *XNVME_UNUSED(dev), void *buf)
+xnvme_be_upcie_buf_free_on(struct xnvme_be_upcie_ctrlr *ctrlr, void *buf)
 {
 	size_t offset;
 
@@ -81,7 +86,7 @@ xnvme_be_upcie_buf_free(const struct xnvme_dev *XNVME_UNUSED(dev), void *buf)
 		msg.op = NVME_CPLANE_OP_FREE_BUF;
 		msg.u.mem.offset = offset;
 
-		if (xnvme_be_upcie_ask(&msg, NULL, NULL)) {
+		if (!ctrlr || xnvme_be_upcie_ask(ctrlr->sock, &msg, NULL, NULL)) {
 			XNVME_DEBUG("FAILED: giving back offset(0x%zx)", offset);
 		}
 
@@ -89,6 +94,28 @@ xnvme_be_upcie_buf_free(const struct xnvme_dev *XNVME_UNUSED(dev), void *buf)
 	}
 
 	dmamem_heap_free(&g_upcie_rte.mem.heap, offset);
+}
+
+/**
+ * Allocate from the heap, on behalf of the device's controller
+ *
+ * Attached, the allocator belongs to the server this controller is served by,
+ * so which controller it is decides which socket to ask on.
+ */
+void *
+xnvme_be_upcie_buf_alloc(const struct xnvme_dev *dev, size_t nbytes, uint64_t *phys)
+{
+	struct xnvme_be_upcie_state *state = dev ? (void *)dev->be.state : NULL;
+
+	return xnvme_be_upcie_buf_alloc_on(state ? state->ctrlr : NULL, nbytes, phys);
+}
+
+void
+xnvme_be_upcie_buf_free(const struct xnvme_dev *dev, void *buf)
+{
+	struct xnvme_be_upcie_state *state = dev ? (void *)dev->be.state : NULL;
+
+	xnvme_be_upcie_buf_free_on(state ? state->ctrlr : NULL, buf);
 }
 
 int

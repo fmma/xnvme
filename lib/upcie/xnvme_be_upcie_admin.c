@@ -52,7 +52,7 @@ xnvme_be_upcie_sync_cmd_admin(struct xnvme_cmd_ctx *ctx, void *dbuf, size_t dbuf
 		msg.op = NVME_CPLANE_OP_ADMIN_CMD;
 		memcpy(&msg.u.admin.cmd, cmd, sizeof(msg.u.admin.cmd));
 
-		err = xnvme_be_upcie_ask(&msg, NULL, NULL);
+		err = xnvme_be_upcie_ask(ctrlr->sock, &msg, NULL, NULL);
 		if (err) {
 			XNVME_DEBUG("FAILED: asking for an admin command; err(%d)", err);
 			return err;

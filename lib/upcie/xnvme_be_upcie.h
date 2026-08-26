@@ -75,6 +75,13 @@ struct xnvme_be_upcie_ctrlr {
 	struct nvme_qpair sync; ///< Shared submission/completion queue for synchronous IOs
 	struct xnvme_be_upcie_qpair_offsets sync_offsets; ///< Heap offsets of the sync qpair
 	struct nvme_request admin_prp; ///< PRP scratch for admin payloads, this controller's own
+
+	/* One socket per controller, so a client holding several does not
+	 * describe them all from whichever it opened first. */
+	int sock;                                 ///< To the server; -1 when not attached
+	void *bar0;                               ///< This process's mapping of this BAR0
+	uint64_t bar0_nbytes;                     ///< How much of it
+	const struct nvme_runtime_record *record; ///< In the heap, written by the server
 };
 
 /**
@@ -154,10 +161,10 @@ void
 xnvme_be_upcie_socket_path(uint32_t shm_id, const char *bdf, char *path, size_t nbytes);
 
 int
-xnvme_be_upcie_ask(struct nvme_cplane_msg *msg, int *fds, uint32_t *nfds);
+xnvme_be_upcie_ask(int sock, struct nvme_cplane_msg *msg, int *fds, uint32_t *nfds);
 
 int
-xnvme_be_upcie_attach(uint32_t shm_id, const char *bdf);
+xnvme_be_upcie_attach(uint32_t shm_id, const char *bdf, struct xnvme_be_upcie_ctrlr *ctrlr);
 
 int
 xnvme_be_upcie_query(uint32_t shm_id, const char *bdf, struct nvme_cplane_msg *msg);
@@ -176,10 +183,11 @@ void
 xnvme_be_upcie_detach(void);
 
 int
-xnvme_be_upcie_attach_ctrlr(struct nvme_controller *ctrl);
+xnvme_be_upcie_attach_ctrlr(struct xnvme_be_upcie_ctrlr *ctrlr);
 
 int
-xnvme_be_upcie_attach_qpair(struct nvme_qpair *qpair, uint16_t depth);
+xnvme_be_upcie_attach_qpair(struct xnvme_be_upcie_ctrlr *ctrlr, struct nvme_qpair *qpair,
+			    uint16_t depth);
 
 /**
  * The controller's I/O queue for this process, asked for if it has none yet
@@ -200,7 +208,7 @@ void
 xnvme_be_upcie_ctrlr_admin_prp_release(struct xnvme_be_upcie_ctrlr *ctrlr);
 
 void
-xnvme_be_upcie_detach_qpair(struct nvme_qpair *qpair);
+xnvme_be_upcie_detach_qpair(struct xnvme_be_upcie_ctrlr *ctrlr, struct nvme_qpair *qpair);
 
 int
 xnvme_be_upcie_alloc_buf(size_t nbytes, uint64_t *offset);
@@ -252,13 +260,9 @@ struct xnvme_be_upcie_rte_mem {
  * closing is how a client's queues and allocs come back.
  */
 struct xnvme_be_upcie_rte_attached {
-	int sock;                                 ///< To the server; -1 when not attached
-	int alive;                                ///< Whether the rest of this means anything
-	void *heap_base;                          ///< This process's mapping of the heap
-	uint64_t heap_nbytes;                     ///< How much of it
-	void *bar0;                               ///< This process's mapping of BAR0
-	uint64_t bar0_nbytes;                     ///< How much of it
-	const struct nvme_runtime_record *record; ///< In the heap, written by the server
+	int alive;            ///< Whether this process is a client of a server
+	void *heap_base;      ///< This process's mapping of the server's heap
+	uint64_t heap_nbytes; ///< How much of it
 };
 
 struct xnvme_be_upcie_rte {
@@ -356,6 +360,12 @@ xnvme_be_upcie_sync_cmd_pseudo(struct xnvme_cmd_ctx *ctx, void *dbuf, size_t dbu
 
 void *
 xnvme_be_upcie_buf_alloc(const struct xnvme_dev *dev, size_t nbytes, uint64_t *phys);
+
+void *
+xnvme_be_upcie_buf_alloc_on(struct xnvme_be_upcie_ctrlr *ctrlr, size_t nbytes, uint64_t *phys);
+
+void
+xnvme_be_upcie_buf_free_on(struct xnvme_be_upcie_ctrlr *ctrlr, void *buf);
 
 void
 xnvme_be_upcie_buf_free(const struct xnvme_dev *dev, void *buf);
