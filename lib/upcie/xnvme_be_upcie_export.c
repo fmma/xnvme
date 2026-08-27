@@ -287,6 +287,26 @@ xnvme_be_upcie_admin(struct xnvme_dev *dev, void *cmd, void *cpl)
 	return nvme_qpair_submit_sync(&ctrl->aq, cmd, ctrl->timeout_ms, cpl);
 }
 
+#define PAYLOAD_GRANULE (2ULL * 1024 * 1024)
+#define PAYLOAD_GRANULES_MAX 64
+
+/**
+ * Hugepages carved for client payloads, and what still lives in each
+ *
+ * Payloads are kept off the hugepages holding queue memory. A drive fetching
+ * SQEs and posting CQEs while writing payloads into the same 2 MiB page is
+ * measurably slower at it: on a Samsung 9100 PRO, 512 B randread at qd128 fell
+ * from 4.07M IOPS to 3.2M with the payload buffer a few pages below the SQ,
+ * and recovered when only the buffer moved. First-fit put it there reliably,
+ * since the identify payloads freed during attach leave holes right under the
+ * queues.
+ */
+static struct {
+	size_t base; ///< Heap offset of the granule, aligned to PAYLOAD_GRANULE
+	size_t used; ///< How much of it has been handed out
+	int nallocs; ///< Live allocations in it; the granule goes back at zero
+} g_payload[PAYLOAD_GRANULES_MAX];
+
 /**
  * Allocate from the heap on a client's behalf
  *
@@ -302,7 +322,8 @@ xnvme_be_upcie_admin(struct xnvme_dev *dev, void *cmd, void *cpl)
 int
 xnvme_be_upcie_alloc_buf(size_t nbytes, uint64_t *offset)
 {
-	size_t at;
+	size_t at, want;
+	int free_slot = -1;
 	int err;
 
 	if (!nbytes || !offset) {
@@ -312,11 +333,52 @@ xnvme_be_upcie_alloc_buf(size_t nbytes, uint64_t *offset)
 		return -ENOTCONN;
 	}
 
-	err = dmamem_heap_alloc(&g_upcie_rte.mem.heap, nbytes, &at);
+	/* Anything from a granule upwards already gets a page to itself. */
+	if (nbytes >= PAYLOAD_GRANULE) {
+		err = dmamem_heap_alloc_aligned(&g_upcie_rte.mem.heap, nbytes, PAYLOAD_GRANULE,
+						&at);
+		if (err) {
+			XNVME_DEBUG("FAILED: dmamem_heap_alloc_aligned(%zu); err(%d)", nbytes,
+				    err);
+			return err;
+		}
+
+		*offset = at;
+
+		return 0;
+	}
+
+	want = (nbytes + 63) & ~(size_t)63;
+
+	for (int i = 0; i < PAYLOAD_GRANULES_MAX; ++i) {
+		if (!g_payload[i].nallocs) {
+			free_slot = (free_slot < 0) ? i : free_slot;
+			continue;
+		}
+		if ((PAYLOAD_GRANULE - g_payload[i].used) >= want) {
+			*offset = g_payload[i].base + g_payload[i].used;
+			g_payload[i].used += want;
+			g_payload[i].nallocs++;
+
+			return 0;
+		}
+	}
+
+	if (free_slot < 0) {
+		XNVME_DEBUG("FAILED: no room for another payload granule");
+		return -ENOSPC;
+	}
+
+	err = dmamem_heap_alloc_aligned(&g_upcie_rte.mem.heap, PAYLOAD_GRANULE, PAYLOAD_GRANULE,
+					&at);
 	if (err) {
-		XNVME_DEBUG("FAILED: dmamem_heap_alloc(%zu); err(%d)", nbytes, err);
+		XNVME_DEBUG("FAILED: dmamem_heap_alloc_aligned(granule); err(%d)", err);
 		return err;
 	}
+
+	g_payload[free_slot].base = at;
+	g_payload[free_slot].used = want;
+	g_payload[free_slot].nallocs = 1;
 
 	*offset = at;
 
@@ -335,6 +397,25 @@ xnvme_be_upcie_free_buf(uint64_t offset)
 {
 	if (!g_upcie_rte.mem.heap_alive) {
 		return -ENOTCONN;
+	}
+
+	for (int i = 0; i < PAYLOAD_GRANULES_MAX; ++i) {
+		if (!g_payload[i].nallocs || (offset < g_payload[i].base) ||
+		    (offset >= (g_payload[i].base + PAYLOAD_GRANULE))) {
+			continue;
+		}
+
+		/* Handed out by bumping, so the space comes back only once the
+		 * last of them does, which is when the granule itself goes. */
+		if (--g_payload[i].nallocs) {
+			return 0;
+		}
+
+		dmamem_heap_free(&g_upcie_rte.mem.heap, g_payload[i].base);
+		g_payload[i].base = 0;
+		g_payload[i].used = 0;
+
+		return 0;
 	}
 
 	dmamem_heap_free(&g_upcie_rte.mem.heap, offset);
