@@ -45,7 +45,7 @@
 #define SERVE_DEVS_MAX 16
 #define SERVE_IOQPAIRS_PER_CLIENT 8
 
-#define SERVE_ALLOCS_PER_CLIENT 32
+#define SERVE_ALLOCS_PER_CLIENT 1024
 
 struct serve_client {
 	int sock;
