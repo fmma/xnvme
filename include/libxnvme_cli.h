@@ -100,6 +100,7 @@ struct xnvme_cli_args {
 	uint32_t dev_id;
 	uint32_t max_io_bytes;
 	bool direct;
+	bool cq_mirror;
 	uint32_t limit;
 
 	uint64_t count;
@@ -386,7 +387,9 @@ enum xnvme_cli_opt {
 
 	XNVME_CLI_OPT_ALT_URI = 138, ///< XNVME_CLI_OPT_ALT_URI
 
-	XNVME_CLI_OPT_END = 139, ///< XNVME_CLI_OPT_END
+	XNVME_CLI_OPT_CQ_MIRROR = 139, ///< XNVME_CLI_OPT_CQ_MIRROR
+
+	XNVME_CLI_OPT_END = 140, ///< XNVME_CLI_OPT_END
 };
 
 /**
