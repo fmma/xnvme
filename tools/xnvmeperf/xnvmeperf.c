@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include <libxnvme.h>
+#include <xnvme_vcs.h>
 
 #include "xnvmeperf.h"
 
@@ -465,10 +466,12 @@ print_perf_results(const char *title, double elapsed, const char **uris, int nde
 {
 	double total_iops = 0, total_mibps = 0;
 	uint64_t total_failed = 0;
+	const char *vcs = xnvme_ver_vcs();
 
 	printf("\n");
 	printf("====================================================================\n");
-	printf(" %s (elapsed: %.2fs)\n", title, elapsed);
+	printf(" %s (v%d.%d.%d%s%s) (elapsed: %.2fs)\n", title, xnvme_ver_major(),
+	       xnvme_ver_minor(), xnvme_ver_patch(), *vcs ? " - " : "", vcs, elapsed);
 	printf("====================================================================\n");
 	if (cpus) {
 		printf(" %-20s  %6s  %12s %10s %8s\n", "Device", "CPUs", "IOPS", "MiB/s",
@@ -1407,6 +1410,7 @@ static struct xnvme_cli_sub g_subs[] = {
 
 static struct xnvme_cli g_cli = {
 	.title = "xnvmeperf - NVMe async IO benchmark",
+	.vcs = XNVME_VCS_TAG,
 	.descr_short = "Run async IO benchmarks against NVMe devices",
 	.descr_long = "",
 	.subs = g_subs,
