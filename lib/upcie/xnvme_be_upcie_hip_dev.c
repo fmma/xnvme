@@ -8,6 +8,7 @@
 #ifdef XNVME_BE_UPCIE_HIP_ENABLED
 #include <stdatomic.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <xnvme_dev.h>
 #include <xnvme_be_upcie_hip.h>
 #include <xnvme_be_upcie_hip_cqmirror.h>
@@ -102,6 +103,118 @@ _hip_ctrlr_init(struct xnvme_be_upcie_ctrlr *ctrlr, const char *ctrlr_bdf)
 	return 0;
 }
 
+/** One server-side registration made for a caller buffer, keyed by its attach slot */
+struct _hip_cplane_reg {
+	const struct dmabuf *key;              ///< The backing's attach slot, stable for its lifetime
+	struct xnvme_be_upcie_hip_ctrlr *slot; ///< The slot it was registered through
+	uint64_t reg_offset;                   ///< Names the registration to the server
+	struct _hip_cplane_reg *next;
+};
+
+static struct _hip_cplane_reg *g_hip_cplane_regs;
+
+/**
+ * Register one HIP allocation with the serving process, for a dmamem_registry.
+ *
+ * Same contract as dmamem_hip_registry_populate(), but the client owns no
+ * controller, so the address question goes to the process that does: the
+ * allocation is exported as a dma-buf and sent over the cplane, and the reply
+ * describes how it resolves, in whatever form the server's mode produces.
+ */
+static int
+_hip_cplane_populate(void *ctx, uint64_t base, size_t size, uint64_t granularity,
+		     uint64_t *lut_out, size_t nlut, struct dmabuf *attach_out)
+{
+	struct hipmem_config *config = ctx;
+	const size_t pagesize = (size_t)config->device_pagesize;
+	const size_t export_nbytes = (size + pagesize - 1) & ~(pagesize - 1);
+	const struct hostmem_shared_desc *desc = NULL;
+	struct xnvme_be_upcie_hip_ctrlr *slot = NULL;
+	struct _hip_cplane_reg *reg;
+	uint64_t reg_offset = 0;
+	int dmabuf_fd = -1;
+	hipError_t cr;
+	int err;
+
+	/* One registration serves every held controller: the description is
+	 * controller-independent, and the server dedups the region. */
+	for (int i = 0; i < XNVME_BE_UPCIE_GPU_CTRLRS_MAX; ++i) {
+		if (g_upcie_hip_rte.ctrlrs[i].ctrlr) {
+			slot = &g_upcie_hip_rte.ctrlrs[i];
+			break;
+		}
+	}
+	if (!slot) {
+		XNVME_DEBUG("FAILED: no served controller to register with");
+		return -ENOTCONN;
+	}
+
+	reg = calloc(1, sizeof(*reg));
+	if (!reg) {
+		return -ENOMEM;
+	}
+
+	cr = hipMemGetHandleForAddressRange(&dmabuf_fd, (hipDeviceptr_t)base, export_nbytes,
+					    hipMemRangeHandleTypeDmaBufFd, 0);
+	if (cr != hipSuccess) {
+		XNVME_DEBUG("FAILED: hipMemGetHandleForAddressRange(0x%" PRIx64 ", %zu); cr(%d)",
+			    base, export_nbytes, cr);
+		free(reg);
+		return -EIO;
+	}
+
+	err = xnvme_be_upcie_cplane_register_client_mem(slot->ctrlr, dmabuf_fd, export_nbytes,
+							(uint32_t)pagesize, &desc, &reg_offset);
+	/* SCM_RIGHTS gave the server its own reference; this copy is done. */
+	close(dmabuf_fd);
+	if (err) {
+		XNVME_DEBUG("FAILED: registering client mem with the server; err(%d)", err);
+		free(reg);
+		return err;
+	}
+
+	err = hostmem_shared_desc_lut(desc, granularity, lut_out, nlut);
+	if (err) {
+		XNVME_DEBUG("FAILED: hostmem_shared_desc_lut(); err(%d)", err);
+		xnvme_be_upcie_cplane_unregister_client_mem(slot->ctrlr, reg_offset);
+		free(reg);
+		return err;
+	}
+
+	reg->key = attach_out;
+	reg->slot = slot;
+	reg->reg_offset = reg_offset;
+	reg->next = g_hip_cplane_regs;
+	g_hip_cplane_regs = reg;
+
+	return 0;
+}
+
+/** Undo _hip_cplane_populate(): the server lets go of the region */
+static void
+_hip_cplane_release(void *XNVME_UNUSED(ctx), struct dmabuf *attach)
+{
+	struct _hip_cplane_reg **link = &g_hip_cplane_regs;
+
+	while (*link) {
+		struct _hip_cplane_reg *reg = *link;
+
+		if (reg->key != attach) {
+			link = &reg->next;
+			continue;
+		}
+		if (reg->slot->ctrlr) {
+			/* Unchecked: a server that has gone reclaims on the
+			 * socket closing regardless. */
+			xnvme_be_upcie_cplane_unregister_client_mem(reg->slot->ctrlr,
+								    reg->reg_offset);
+		}
+		*link = reg->next;
+		free(reg);
+		return;
+	}
+}
+
 static int
 _hip_rte_init(size_t heap_size, uint32_t gpu_id, struct xnvme_be_upcie_ctrlr *ctrlr,
 	      const char *bdf)
@@ -169,10 +282,15 @@ _hip_rte_init(size_t heap_size, uint32_t gpu_id, struct xnvme_be_upcie_ctrlr *ct
 			(uint32_t)g_upcie_hip_rte.hip_config.device_pagesize, &desc,
 			&slot->reg_offset);
 		if (!err) {
-			err = dmamem_from_shared(&g_upcie_hip_rte.dmem,
-						 (void *)(uintptr_t)g_upcie_hip_rte.hip_heap.vaddr,
-						 desc, xnvme_be_upcie_va_bits(),
-						 DMAMEM_BACKING_HIPMEM);
+			/* A registry in both modes, populated over the cplane,
+			 * so caller buffers register like they do on an owner. */
+			err = dmamem_from_shared_registry(
+				&g_upcie_hip_rte.dmem,
+				(void *)(uintptr_t)g_upcie_hip_rte.hip_heap.vaddr, desc,
+				(size_t)g_upcie_hip_rte.hip_config.device_pagesize,
+				xnvme_be_upcie_va_bits(), DMAMEM_BACKING_HIPMEM,
+				dmamem_hip_registry_range, _hip_cplane_populate,
+				_hip_cplane_release, &g_upcie_hip_rte.hip_config);
 		}
 		if (err) {
 			XNVME_DEBUG("FAILED: registering the HIP heap with the server; err(%d)",
