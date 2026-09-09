@@ -219,6 +219,65 @@ hostmem_shared_desc_addr(const struct hostmem_shared_desc *desc, uint64_t offset
 }
 
 /**
+ * Fill a translator's table from a description
+ *
+ * One entry per `granularity` from the region's start. An arithmetic
+ * description resolves any granularity; a LUT one must be at least as fine as
+ * the table it fills, and each granule it makes up is verified contiguous, as
+ * dmamem_registry_adopt() would.
+ *
+ * @param desc The description, as the registering side left it
+ * @param granularity Bytes each entry covers; a power of two
+ * @param lut Destination, `nlut` entries
+ * @param nlut Number of entries to fill
+ *
+ * @return 0 on success, negative errno on failure
+ */
+static inline int
+hostmem_shared_desc_lut(const struct hostmem_shared_desc *desc, uint64_t granularity, uint64_t *lut,
+			size_t nlut)
+{
+	uint64_t gran, step;
+
+	if (!desc || !lut || !nlut || !granularity || (granularity & (granularity - 1))) {
+		return -EINVAL;
+	}
+	if (desc->version != HOSTMEM_SHARED_DESC_VERSION) {
+		return -EPROTO;
+	}
+
+	if (HOSTMEM_SHARED_ARITHMETIC == desc->kind) {
+		for (size_t k = 0; k < nlut; ++k) {
+			lut[k] = desc->base_addr + (k * granularity);
+		}
+		return 0;
+	}
+
+	gran = (uint64_t)1 << desc->gran_shift;
+	if (granularity < gran) {
+		return -EINVAL;
+	}
+	step = granularity / gran;
+	if ((nlut * step) > desc->nphys) {
+		return -ERANGE;
+	}
+
+	for (size_t k = 0; k < nlut; ++k) {
+		const uint64_t first = k * step;
+
+		for (uint64_t i = 1; i < step; ++i) {
+			if (desc->phys[first + i] != (desc->phys[first] + (i * gran))) {
+				UPCIE_DEBUG("FAILED: described granule(%zu) not contiguous", k);
+				return -EOPNOTSUPP;
+			}
+		}
+		lut[k] = desc->phys[first];
+	}
+
+	return 0;
+}
+
+/**
  * What to allocate for a description of a region with this many granules
  */
 static inline size_t
@@ -353,6 +412,93 @@ dmamem_from_shared(struct dmamem *dmem, void *base, const struct hostmem_shared_
 
 	err = dmamem_registry_adopt(&dmem->registry, base, desc->nbytes, desc->phys,
 				    (int)desc->gran_shift, NULL);
+	if (err) {
+		UPCIE_DEBUG("FAILED: dmamem_registry_adopt(); err(%d)", err);
+		dmamem_registry_term(&dmem->registry);
+		return err;
+	}
+
+	dmem->fd = -1;
+	dmem->cpu_va = (backing == DMAMEM_BACKING_HOSTMEM) ? base : NULL;
+	dmem->base_va = base;
+	dmem->size = desc->nbytes;
+	dmem->backing = backing;
+	dmem->translator = DMAMEM_XLATE_LUT;
+	dmem->owned = 0;
+
+	return 0;
+}
+
+/**
+ * Build a dmamem over shared memory that can also take caller buffers
+ *
+ * dmamem_from_shared() adopts the description and nothing more, so its
+ * registry refuses dmamem_register(). Here the caller supplies the registry
+ * callbacks, and a buffer registered later is made addressable through
+ * `populate`, the way the described region itself was made addressable by
+ * whoever described it. An arithmetic description is adopted into the table
+ * as well, entry by entry, since a translator that resolves from one base
+ * has no place for a second region.
+ *
+ * @param dmem Pre-allocated dmamem to fill
+ * @param base This process's mapping of the shared region
+ * @param desc The server's description, found at the offset it named
+ * @param granularity Bytes per table entry; a LUT description must be as fine
+ * @param va_bits Bounds the LUT reservation; 0 selects the default
+ * @param backing What the region actually is
+ * @param range Recovers the allocation a pointer falls inside; may be NULL
+ * @param populate Makes a caller buffer addressable
+ * @param release Undoes populate; may be NULL
+ * @param ctx Opaque flavour context handed to the callbacks
+ *
+ * @return 0 on success, negative errno on failure
+ */
+static inline int
+dmamem_from_shared_registry(struct dmamem *dmem, void *base, const struct hostmem_shared_desc *desc,
+			    size_t granularity, int va_bits, enum dmamem_backing backing,
+			    dmamem_registry_range_fn range, dmamem_registry_populate_fn populate,
+			    dmamem_registry_release_fn release, void *ctx)
+{
+	int err;
+
+	if (!dmem || !base || !desc || !populate) {
+		return -EINVAL;
+	}
+	if (desc->version != HOSTMEM_SHARED_DESC_VERSION) {
+		UPCIE_DEBUG("FAILED: description version(%u), expected(%u)", desc->version,
+			    HOSTMEM_SHARED_DESC_VERSION);
+		return -EPROTO;
+	}
+
+	memset(dmem, 0, sizeof(*dmem));
+
+	err = dmamem_registry_init(&dmem->registry, granularity, va_bits, range, populate, release,
+				   ctx);
+	if (err) {
+		UPCIE_DEBUG("FAILED: dmamem_registry_init(); err(%d)", err);
+		return err;
+	}
+
+	if (HOSTMEM_SHARED_ARITHMETIC == desc->kind) {
+		const size_t nlut = (desc->nbytes + granularity - 1) / granularity;
+		uint64_t *lut;
+
+		lut = calloc(nlut, sizeof(*lut));
+		if (!lut) {
+			dmamem_registry_term(&dmem->registry);
+			return -ENOMEM;
+		}
+
+		err = hostmem_shared_desc_lut(desc, granularity, lut, nlut);
+		if (!err) {
+			err = dmamem_registry_adopt(&dmem->registry, base, desc->nbytes, lut,
+						    dmem->registry.gran_shift, NULL);
+		}
+		free(lut);
+	} else {
+		err = dmamem_registry_adopt(&dmem->registry, base, desc->nbytes, desc->phys,
+					    (int)desc->gran_shift, NULL);
+	}
 	if (err) {
 		UPCIE_DEBUG("FAILED: dmamem_registry_adopt(); err(%d)", err);
 		dmamem_registry_term(&dmem->registry);
