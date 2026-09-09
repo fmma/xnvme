@@ -291,7 +291,10 @@ _cuda_rte_init(size_t heap_size, uint32_t gpu_id, struct xnvme_be_upcie_ctrlr *c
 
 	/* How the heap is described to a controller depends on what that
 	 * controller consumes, and on whether this process owns it at all. A
-	 * client owns none of them, so the server answers. Otherwise: physical
+	 * client owns none of them, so the server answers; though where the
+	 * addresses are physical the client reads them itself, keeping the
+	 * registry open to caller buffers, and the server's answer is the
+	 * fallback. Otherwise: physical
 	 * addresses read the same from every controller, so one table serves
 	 * them all; under an enforcing IOMMU they do not, and there are two
 	 * ways to get addresses it will accept. iommufd maps the heap once for
@@ -316,10 +319,29 @@ _cuda_rte_init(size_t heap_size, uint32_t gpu_id, struct xnvme_be_upcie_ctrlr *c
 			if (_cuda_doorbells_init(slot, ctrlr->bar0, ctrlr->bar0_nbytes, bdf)) {
 				XNVME_DEBUG("FAILED: no doorbell mapping the GPU can reach");
 			}
-			err = dmamem_from_shared(
-				&g_upcie_cuda_rte.dmem,
-				(void *)(uintptr_t)g_upcie_cuda_rte.cuda_heap.vaddr, desc,
-				xnvme_be_upcie_va_bits(), DMAMEM_BACKING_CUDAMEM);
+			err = -EOPNOTSUPP;
+			if (!xnvme_be_upcie_iova_range_required()) {
+				/* Physical addresses are as much the client's
+				 * to read as the server's. The local registry
+				 * keeps its populate path, so dmamem_register()
+				 * accepts caller buffers here as it does for an
+				 * owned controller; the server's description
+				 * covers the heap alone. */
+				err = dmamem_from_cuda_registry(&g_upcie_cuda_rte.dmem,
+								&g_upcie_cuda_rte.cuda_heap,
+								xnvme_be_upcie_va_bits());
+				if (err) {
+					XNVME_DEBUG("FAILED: dmamem_from_cuda_registry(); "
+						    "err(%d); using the server's description",
+						    err);
+				}
+			}
+			if (err) {
+				err = dmamem_from_shared(
+					&g_upcie_cuda_rte.dmem,
+					(void *)(uintptr_t)g_upcie_cuda_rte.cuda_heap.vaddr, desc,
+					xnvme_be_upcie_va_bits(), DMAMEM_BACKING_CUDAMEM);
+			}
 		}
 		if (err) {
 			XNVME_DEBUG("FAILED: registering the CUDA heap with the server; err(%d)",
