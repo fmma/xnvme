@@ -6,6 +6,7 @@
 #include <xnvme_be_nosys.h>
 #ifdef XNVME_BE_UPCIE_HIP_ENABLED
 #include <errno.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <xnvme_be_upcie_hip.h>
 #include <xnvme_hip_buf.h>
@@ -51,29 +52,135 @@ xnvme_be_upcie_hip_buf_vtophys(const struct xnvme_dev *dev, void *buf, uint64_t 
 	return 0;
 }
 
+/**
+ * Buffer objects a served client has registered with the server
+ *
+ * ROCm exports the dma-buf of the whole buffer object a range lies in, and
+ * small allocations share an object. The server is given an object once, and
+ * the ranges registered inside it count on that.
+ */
+static struct {
+	struct {
+		char *base;
+		size_t nbytes;
+		struct xnvme_be_upcie_ctrlr *ctrlr;
+		int refs;
+	} *entries;
+	int count;
+	int capacity;
+} g_objects;
+
+static int
+_object_find(const void *vaddr, const struct xnvme_be_upcie_ctrlr *ctrlr)
+{
+	for (int i = 0; i < g_objects.count; ++i) {
+		const char *base = g_objects.entries[i].base;
+
+		if ((g_objects.entries[i].ctrlr == ctrlr) && ((const char *)vaddr >= base) &&
+		    ((const char *)vaddr < (base + g_objects.entries[i].nbytes))) {
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+static int
+_object_add(void *base, size_t nbytes, struct xnvme_be_upcie_ctrlr *ctrlr)
+{
+	if (g_objects.count == g_objects.capacity) {
+		int capacity = g_objects.capacity ? 2 * g_objects.capacity : 16;
+		void *grown =
+			realloc(g_objects.entries, (size_t)capacity * sizeof(*g_objects.entries));
+
+		if (!grown) {
+			return -ENOMEM;
+		}
+		g_objects.entries = grown;
+		g_objects.capacity = capacity;
+	}
+
+	g_objects.entries[g_objects.count].base = base;
+	g_objects.entries[g_objects.count].nbytes = nbytes;
+	g_objects.entries[g_objects.count].ctrlr = ctrlr;
+	g_objects.entries[g_objects.count].refs = 1;
+	g_objects.count++;
+
+	return 0;
+}
+
+static int
+_served_map(const struct xnvme_be_upcie_state *state, void *vaddr, size_t nbytes)
+{
+	const uint32_t page_size = (uint32_t)g_upcie_hip_rte.hip_config.device_pagesize;
+	size_t object_nbytes = 0;
+	void *base = NULL;
+	int dmabuf_fd = -1;
+	int at, err;
+
+	if (((uintptr_t)vaddr & (page_size - 1)) || (nbytes & (page_size - 1))) {
+		XNVME_DEBUG("FAILED: vaddr(%p) nbytes(%zu) not aligned to page_size(%u)", vaddr,
+			    nbytes, page_size);
+		return -EINVAL;
+	}
+
+	err = xnvme_hip_buf_export_dmabuf(vaddr, nbytes, &base, &object_nbytes, &dmabuf_fd);
+	if (err) {
+		return err;
+	}
+
+	at = _object_find(base, state->ctrlr);
+	if (at >= 0) {
+		close(dmabuf_fd);
+		g_objects.entries[at].refs++;
+		return 0;
+	}
+
+	err = xnvme_be_upcie_served_mem_map(state->dmem, state->ctrlr, dmabuf_fd, base,
+					    object_nbytes, page_size);
+	close(dmabuf_fd);
+	if (err) {
+		return err;
+	}
+
+	err = _object_add(base, object_nbytes, state->ctrlr);
+	if (err) {
+		xnvme_be_upcie_served_mem_unmap(state->dmem, state->ctrlr, base);
+	}
+
+	return err;
+}
+
+static int
+_served_unmap(const struct xnvme_be_upcie_state *state, void *vaddr)
+{
+	void *base;
+	int at;
+
+	at = _object_find(vaddr, state->ctrlr);
+	if (at < 0) {
+		return -EINVAL;
+	}
+	if (--g_objects.entries[at].refs) {
+		return 0;
+	}
+
+	base = g_objects.entries[at].base;
+	g_objects.entries[at] = g_objects.entries[--g_objects.count];
+
+	return xnvme_be_upcie_served_mem_unmap(state->dmem, state->ctrlr, base);
+}
+
 static int
 _map(const struct xnvme_dev *dev, void *vaddr, size_t nbytes)
 {
 	const struct xnvme_be_upcie_state *state = &xnvme_be_state(dev)->upcie_state;
-	size_t dmabuf_nbytes = 0;
-	void *base = NULL;
-	int dmabuf_fd = -1;
-	int err;
 
 	if (!g_upcie_rte.connection.alive) {
 		return xnvme_be_upcie_dmamem_map(state->dmem, vaddr, nbytes, NULL);
 	}
 
-	err = xnvme_hip_buf_export_dmabuf(vaddr, nbytes, &base, &dmabuf_nbytes, &dmabuf_fd);
-	if (err) {
-		return err;
-	}
-
-	err = xnvme_be_upcie_served_mem_map(state->dmem, state->ctrlr, dmabuf_fd, vaddr, nbytes,
-					    (uint32_t)g_upcie_hip_rte.hip_config.device_pagesize);
-	close(dmabuf_fd);
-
-	return err;
+	return _served_map(state, vaddr, nbytes);
 }
 
 static int
@@ -82,7 +189,7 @@ _unmap(const struct xnvme_dev *dev, void *vaddr)
 	const struct xnvme_be_upcie_state *state = &xnvme_be_state(dev)->upcie_state;
 
 	if (g_upcie_rte.connection.alive) {
-		return xnvme_be_upcie_served_mem_unmap(state->dmem, state->ctrlr, vaddr);
+		return _served_unmap(state, vaddr);
 	}
 
 	return xnvme_be_upcie_dmamem_unmap(state->dmem, vaddr);

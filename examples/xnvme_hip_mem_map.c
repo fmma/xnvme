@@ -58,11 +58,6 @@ main(int argc, char **argv)
 	nlb = 8;
 	buf_nbytes = nlb * lba_nbytes;
 
-	/* AMD's dma-buf export wants a 2 MiB-aligned range, coarser than the
-	 * 4 KiB allocation granularity, so give registration something it can
-	 * actually export rather than the bare payload size. */
-	buf_nbytes = (buf_nbytes + (2 * 1024 * 1024ULL) - 1) & ~((2 * 1024 * 1024ULL) - 1);
-
 	herr = hipMalloc(&buf, buf_nbytes);
 	if (herr != hipSuccess) {
 		err = -ENOMEM;
