@@ -55,6 +55,8 @@ static int
 _map(const struct xnvme_dev *dev, void *vaddr, size_t nbytes)
 {
 	const struct xnvme_be_upcie_state *state = &xnvme_be_state(dev)->upcie_state;
+	size_t dmabuf_nbytes = 0;
+	void *base = NULL;
 	int dmabuf_fd = -1;
 	int err;
 
@@ -62,7 +64,7 @@ _map(const struct xnvme_dev *dev, void *vaddr, size_t nbytes)
 		return xnvme_be_upcie_dmamem_map(state->dmem, vaddr, nbytes, NULL);
 	}
 
-	err = xnvme_hip_buf_export_dmabuf(vaddr, nbytes, &dmabuf_fd);
+	err = xnvme_hip_buf_export_dmabuf(vaddr, nbytes, &base, &dmabuf_nbytes, &dmabuf_fd);
 	if (err) {
 		return err;
 	}

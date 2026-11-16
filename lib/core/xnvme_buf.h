@@ -9,9 +9,9 @@
  * Export the CUDA or HIP allocation holding vaddr as a dma-buf
  *
  * @param vaddr An address of CUDA or HIP device memory
- * @param base Set to the start of the allocation
- * @param nbytes Set to the length of the allocation
- * @param fd Set to the dma-buf of the allocation, which the caller closes
+ * @param base Set to the address the dma-buf starts at
+ * @param nbytes Set to the length of the dma-buf
+ * @param fd Set to the dma-buf, which the caller closes
  *
  * @return On success, 0 is returned. `-EINVAL` when vaddr is neither CUDA nor HIP device memory,
  * and another negative `errno` on error.

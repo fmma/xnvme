@@ -157,6 +157,14 @@ hip_dep = cc.find_library(
   header_args: ['-D__HIP_PLATFORM_AMD__'],
   required: get_option('with-hip'),
 )
+# The ROCm runtime below HIP, for the dma-buf export that reports where a range
+# lies in the buffer object it exports. Required once HIP is found, so that a
+# missing header fails the configuration instead of dropping the backend.
+hsa_dep = cc.find_library(
+  'hsa-runtime64',
+  has_headers: ['hsa/hsa_ext_amd.h'],
+  required: hip_dep.found(),
+)
 conf_data.set('XNVME_HIP_ENABLED', is_linux and hip_dep.found() and get_option('with-hip').allowed())
 conf_data.set('XNVME_BE_UPCIE_HIP_ENABLED', be_upcie and conf_data.get('XNVME_HIP_ENABLED'))
 if conf_data.get('XNVME_HIP_ENABLED')

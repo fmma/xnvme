@@ -30,6 +30,7 @@ xnvmelib_deps = [
   rt_dep,
   cuda_dep,
   hip_dep,
+  hsa_dep,
   upcie_dep,
 ]
 
